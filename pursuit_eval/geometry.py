@@ -29,7 +29,10 @@ def canonicalize_follow_yaw_deg(yaw_deg: float) -> float:
     return float(yaw_deg)
 
 
-def get_camera_intrinsic(width: int, height: int, fov_deg: float) -> np.ndarray:
+def get_camera_intrinsic(
+        width: int,
+        height: int,
+        fov_deg: float) -> np.ndarray:
     """Return a pinhole intrinsic matrix for the CARLA RGB camera."""
     focal = width / (2.0 * np.tan(np.radians(fov_deg) / 2.0))
     cx = width / 2.0
@@ -50,9 +53,12 @@ def project_lidar_points_to_image(
     """Project LiDAR-frame 3D points into image pixel coordinates."""
     if points_xyz.size == 0:
         empty = np.zeros((0, 2), dtype=np.float64)
-        return empty, np.zeros((0,), dtype=bool), np.zeros((0,), dtype=np.float64)
+        return empty, np.zeros(
+            (0,), dtype=bool), np.zeros(
+            (0,), dtype=np.float64)
 
-    points_h = np.hstack([points_xyz[:, :3], np.ones((points_xyz.shape[0], 1))])
+    points_h = np.hstack(
+        [points_xyz[:, :3], np.ones((points_xyz.shape[0], 1))])
     points_cam = (lidar_to_camera @ points_h.T).T
 
     x_cam = points_cam[:, 1]

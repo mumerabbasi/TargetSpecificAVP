@@ -1,506 +1,348 @@
-"""PyTorch Dataset for pose estimation from RGB images and bounding boxes."""
+"""Dataset utilities for mask-conditioned target pose learning."""
 
-import os
-from typing import Dict, Optional, Tuple
+from __future__ import annotations
+
+import csv
+import math
+import random
+from collections import defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Mapping, MutableMapping, Sequence, Tuple
 
 import numpy as np
-import pandas as pd
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
+from torchvision.transforms import functional as TF
 
 from .config import PoseEstimationConfig
 
 
+@dataclass(frozen=True)
+class TranslationStats:
+    """Mean and standard deviation for translation targets."""
+
+    mean: Tuple[float, float]
+    std: Tuple[float, float]
+
+    def to_dict(self) -> Dict[str, List[float]]:
+        return {
+            "mean": list(self.mean),
+            "std": list(self.std),
+        }
+
+    @classmethod
+    def from_rows(
+            cls, rows: Sequence[Mapping[str, str]]) -> "TranslationStats":
+        if not rows:
+            raise ValueError(
+                "Cannot compute translation statistics from an empty split")
+        values = np.array(
+            [
+                [float(row["dx_m"]), float(row["dy_m"])]
+                for row in rows
+            ],
+            dtype=np.float32,
+        )
+        mean = values.mean(axis=0)
+        std = values.std(axis=0)
+        std = np.clip(std, a_min=1e-6, a_max=None)
+        return cls(
+            mean=tuple(float(v) for v in mean),
+            std=tuple(float(v) for v in std),
+        )
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str,
+                  Sequence[float]]) -> "TranslationStats":
+        return cls(
+            mean=tuple(float(v) for v in payload["mean"]),
+            std=tuple(float(v) for v in payload["std"]),
+        )
+
+
+def load_pose_rows(config: PoseEstimationConfig) -> List[Dict[str, str]]:
+    """Load the selected pose CSV and filter rows for training."""
+
+    dataset_root = Path(config.dataset_root)
+    csv_path = dataset_root / config.csv_name
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Missing pose CSV: {csv_path}")
+
+    rows: List[Dict[str, str]] = []
+    with csv_path.open("r", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            if config.require_follow_valid and row.get(
+                    "follow_valid", "1") != "1":
+                continue
+            if int(float(row.get("mask_area_px", "0"))
+                   ) < config.min_mask_area_px:
+                continue
+
+            rgb_path = dataset_root / row["rgb_path"]
+            mask_path = dataset_root / row["mask_path"]
+            if not rgb_path.exists() or not mask_path.exists():
+                continue
+
+            rows.append(dict(row))
+
+    if not rows:
+        raise ValueError(
+            f"No training rows remained after filtering {csv_path}")
+    return rows
+
+
+def build_frame_splits(
+    rows: Sequence[Mapping[str, str]],
+    config: PoseEstimationConfig,
+) -> Dict[str, List[Dict[str, str]]]:
+    """Split rows by frame so one RGB frame belongs to exactly one split."""
+
+    frames_by_town: MutableMapping[str,
+                                   List[Tuple[str, str]]] = defaultdict(list)
+    seen_keys = set()
+
+    for row in rows:
+        key = (row["town"], row["frame_id"])
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        frames_by_town[row["town"]].append(key)
+
+    rng = random.Random(config.random_seed)
+    frame_to_split: Dict[Tuple[str, str], str] = {}
+    for town, frame_keys in frames_by_town.items():
+        town_keys = list(frame_keys)
+        rng.shuffle(town_keys)
+        split_sizes = _resolve_split_sizes(
+            len(town_keys),
+            config.train_ratio,
+            config.val_ratio,
+            config.test_ratio,
+        )
+        start = 0
+        for split_name, split_size in split_sizes.items():
+            stop = start + split_size
+            for key in town_keys[start:stop]:
+                frame_to_split[key] = split_name
+            start = stop
+
+    split_rows = {"train": [], "val": [], "test": []}
+    for row in rows:
+        split = frame_to_split[(row["town"], row["frame_id"])]
+        split_rows[split].append(dict(row))
+
+    for split_name, limit in (
+        ("train", config.max_train_samples),
+        ("val", config.max_val_samples),
+        ("test", config.max_test_samples),
+    ):
+        if limit > 0 and len(split_rows[split_name]) > limit:
+            rng.shuffle(split_rows[split_name])
+            split_rows[split_name] = split_rows[split_name][:limit]
+
+    return split_rows
+
+
+def _resolve_split_sizes(
+    total_frames: int,
+    train_ratio: float,
+    val_ratio: float,
+    test_ratio: float,
+) -> Dict[str, int]:
+    if total_frames <= 0:
+        return {"train": 0, "val": 0, "test": 0}
+
+    train_frames = int(total_frames * train_ratio)
+    val_frames = int(total_frames * val_ratio)
+    test_frames = total_frames - train_frames - val_frames
+
+    if total_frames >= 3:
+        if train_frames == 0:
+            train_frames = 1
+        if val_frames == 0:
+            val_frames = 1
+        test_frames = total_frames - train_frames - val_frames
+        if test_frames <= 0:
+            if train_frames >= val_frames and train_frames > 1:
+                train_frames -= 1
+            elif val_frames > 1:
+                val_frames -= 1
+            test_frames = total_frames - train_frames - val_frames
+    elif total_frames == 2:
+        train_frames, val_frames, test_frames = 1, 1, 0
+    else:
+        train_frames, val_frames, test_frames = 1, 0, 0
+
+    return {
+        "train": train_frames,
+        "val": val_frames,
+        "test": test_frames,
+    }
+
+
 class PoseEstimationDataset(Dataset):
-    """Dataset for pose estimation from RGB images and bounding boxes.
-
-    This dataset loads CSV entries and finds corresponding RGB images.
-    Each sample contains an RGB image, bounding box information, and
-    ground truth or predicted pose labels.
-
-    Attributes:
-        config: Configuration object with dataset parameters.
-        df: DataFrame containing pose annotations.
-        transform: Image transformations to apply.
-        indices: List of valid indices after filtering.
-    """
+    """Dataset for mask-conditioned target pose prediction."""
 
     def __init__(
         self,
         config: PoseEstimationConfig,
-        df: pd.DataFrame,
-        transform: Optional[transforms.Compose] = None,
-        is_training: bool = True,
-    ):
-        """Initialize the dataset.
-
-        Args:
-            config: Configuration object.
-            df: DataFrame with pose annotations (already filtered for split).
-            transform: Optional image transformations.
-            is_training: Whether this is for training (enables augmentation).
-        """
+        rows: Sequence[Mapping[str, str]],
+        translation_stats: TranslationStats,
+        training: bool,
+    ) -> None:
         self.config = config
-        self.df = df.reset_index(drop=True)
-        self.is_training = is_training
-
-        # Set up transforms
-        if transform is not None:
-            self.transform = transform
-        else:
-            self.transform = self._get_default_transform()
-
-        # Skip image validation - too slow on remote storage
-        # Images are assumed to exist since they were generated with the CSV
-
-        # Compute normalization statistics if needed
-        self._setup_normalization()
-
-    def _get_default_transform(self) -> transforms.Compose:
-        """Get default image transformations.
-
-        Returns:
-            Compose object with default transforms.
-        """
-        transform_list = []
-
-        if self.is_training:
-            transform_list.extend([
-                transforms.ColorJitter(
-                    brightness=0.2,
-                    contrast=0.2,
-                    saturation=0.2,
-                    hue=0.1
-                ),
-            ])
-
-        transform_list.extend([
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            ),
-        ])
-
-        return transforms.Compose(transform_list)
-
-    def _get_image_path(self, frame_id: int) -> str:
-        """Get the path to an RGB image.
-
-        Args:
-            frame_id: Frame ID from the CSV.
-
-        Returns:
-            Full path to the image file.
-        """
-        return os.path.join(
-            self.config.images_dir,
-            f"rgb_{frame_id:05d}.png"
+        self.rows = [dict(row) for row in rows]
+        self.training = training
+        self.dataset_root = Path(config.dataset_root)
+        self.translation_stats = translation_stats
+        self.color_jitter = transforms.ColorJitter(
+            brightness=0.15,
+            contrast=0.15,
+            saturation=0.1,
+            hue=0.02,
         )
-
-    def _setup_normalization(self) -> None:
-        """Set up pose normalization statistics."""
-        # Use config values or compute from data
-        self.pose_mean = torch.tensor(
-            self.config.pose_mean, dtype=torch.float32
-        )
-        self.pose_std = torch.tensor(
-            self.config.pose_std, dtype=torch.float32
-        )
+        self.rgb_mean = torch.tensor(
+            [0.485, 0.456, 0.406], dtype=torch.float32)
+        self.rgb_std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32)
 
     def __len__(self) -> int:
-        """Return the number of samples in the dataset."""
-        return len(self.df)
+        return len(self.rows)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """Get a single sample.
+    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
+        row = self.rows[index]
+        rgb_image = Image.open(
+            self.dataset_root /
+            row["rgb_path"]).convert("RGB")
+        mask_image = Image.open(
+            self.dataset_root /
+            row["mask_path"]).convert("L")
 
-        Args:
-            idx: Index of the sample.
+        original_width, original_height = rgb_image.size
+        target_width, target_height = self.config.image_size
 
-        Returns:
-            Dictionary containing:
-                - image: Processed image tensor [C, H, W]
-                - bbox: Bounding box coordinates [4] (x1, y1, x2, y2)
-                - bbox_mask: Binary mask of bbox (if bbox_mode includes mask)
-                - pose: Target pose values [num_outputs]
-                - pose_raw: Un-normalized pose values
-                - frame_id: Frame ID for reference
-        """
-        row = self.df.iloc[idx]
+        if self.training:
+            rgb_image = self.color_jitter(rgb_image)
 
-        # Load image
-        frame_id = int(row["frame_id"])
-        img_path = self._get_image_path(frame_id)
-        image = Image.open(img_path).convert("RGB")
+        rgb_image = rgb_image.resize(
+            (target_width, target_height), Image.Resampling.BILINEAR)
+        mask_image = mask_image.resize(
+            (target_width, target_height), Image.Resampling.NEAREST)
 
-        # Get bounding box (in original image coordinates)
-        bbox = np.array([
-            row["bbox_x1"],
-            row["bbox_y1"],
-            row["bbox_x2"],
-            row["bbox_y2"]
-        ], dtype=np.float32)
+        rgb_tensor = TF.to_tensor(rgb_image)
+        rgb_tensor = TF.normalize(
+            rgb_tensor,
+            self.rgb_mean.tolist(),
+            self.rgb_std.tolist())
 
-        # Get pose (GT or predicted based on config)
-        if self.config.use_gt_poses:
-            pose_raw = self._get_gt_pose(row)
-        else:
-            pose_raw = self._get_pred_pose(row)
+        mask_array = np.asarray(mask_image, dtype=np.float32)
+        mask_array = (mask_array > 127).astype(np.float32)
+        mask_tensor = torch.from_numpy(mask_array).unsqueeze(0)
 
-        # Process image based on bbox_mode
-        processed_data = self._process_image_and_bbox(image, bbox)
+        geometry = self._build_geometry_vector(
+            row, original_width, original_height)
+        translation_raw = torch.tensor(
+            [
+                float(row["dx_m"]),
+                float(row["dy_m"]),
+            ],
+            dtype=torch.float32,
+        )
+        translation_target = normalize_translation(
+            translation_raw, self.translation_stats)
 
-        # Normalize pose
-        pose_normalized = self._normalize_pose(pose_raw)
+        yaw_follow_deg = float(row["yaw_follow_deg"])
+        yaw_follow_rad = math.radians(yaw_follow_deg)
+        yaw_target = torch.tensor(
+            [math.sin(yaw_follow_rad), math.cos(yaw_follow_rad)],
+            dtype=torch.float32,
+        )
 
         return {
-            "image": processed_data["image"],
-            "bbox": torch.tensor(bbox, dtype=torch.float32),
-            "bbox_normalized": processed_data.get(
-                "bbox_normalized",
-                torch.zeros(4, dtype=torch.float32)
-            ),
-            "bbox_mask": processed_data.get(
-                "bbox_mask",
-                torch.zeros(1, dtype=torch.float32)
-            ),
-            "pose": pose_normalized,
-            "pose_raw": pose_raw,
-            "frame_id": torch.tensor(frame_id, dtype=torch.long),
+            "input": torch.cat([rgb_tensor, mask_tensor], dim=0),
+            "mask": mask_tensor,
+            "geometry": geometry,
+            "translation_target": translation_target,
+            "translation_raw": translation_raw,
+            "yaw_target": yaw_target,
+            "yaw_follow_deg": torch.tensor(yaw_follow_deg, dtype=torch.float32),
+            "sample_id": row["sample_id"],
+            "frame_id": int(row["frame_id"]),
+            "town": row["town"],
         }
 
-    def _get_gt_pose(self, row: pd.Series) -> torch.Tensor:
-        """Extract ground truth pose from row.
-
-        Args:
-            row: DataFrame row.
-
-        Returns:
-            Tensor with pose values based on config.
-        """
-        pose = []
-        if self.config.predict_dx:
-            pose.append(row["gt_dx_m"])
-        if self.config.predict_dy:
-            pose.append(row["gt_dy_m"])
-        if self.config.predict_dz:
-            pose.append(row["gt_dz_m"])
-        if self.config.predict_yaw:
-            pose.append(row["gt_yaw_deg"])
-
-        return torch.tensor(pose, dtype=torch.float32)
-
-    def _get_pred_pose(self, row: pd.Series) -> torch.Tensor:
-        """Extract predicted pose from row (from 3D detector).
-
-        Args:
-            row: DataFrame row.
-
-        Returns:
-            Tensor with pose values based on config.
-        """
-        pose = []
-        if self.config.predict_dx:
-            pose.append(row["pred_dx_m"])
-        if self.config.predict_dy:
-            pose.append(row["pred_dy_m"])
-        if self.config.predict_dz:
-            pose.append(row["pred_dz_m"])
-        if self.config.predict_yaw:
-            pose.append(row["pred_yaw_deg"])
-
-        return torch.tensor(pose, dtype=torch.float32)
-
-    def _normalize_pose(self, pose: torch.Tensor) -> torch.Tensor:
-        """Normalize pose values.
-
-        Args:
-            pose: Raw pose tensor.
-
-        Returns:
-            Normalized pose tensor.
-        """
-        # Select only the dimensions we're predicting
-        indices = []
-        if self.config.predict_dx:
-            indices.append(0)
-        if self.config.predict_dy:
-            indices.append(1)
-        if self.config.predict_dz:
-            indices.append(2)
-        if self.config.predict_yaw:
-            indices.append(3)
-
-        mean = self.pose_mean[indices]
-        std = self.pose_std[indices]
-
-        return (pose - mean) / std
-
-    def denormalize_pose(self, pose: torch.Tensor) -> torch.Tensor:
-        """Denormalize pose values.
-
-        Args:
-            pose: Normalized pose tensor.
-
-        Returns:
-            Raw pose tensor.
-        """
-        indices = []
-        if self.config.predict_dx:
-            indices.append(0)
-        if self.config.predict_dy:
-            indices.append(1)
-        if self.config.predict_dz:
-            indices.append(2)
-        if self.config.predict_yaw:
-            indices.append(3)
-
-        mean = self.pose_mean[indices].to(pose.device)
-        std = self.pose_std[indices].to(pose.device)
-
-        return pose * std + mean
-
-    def _process_image_and_bbox(
+    def _build_geometry_vector(
         self,
-        image: Image.Image,
-        bbox: np.ndarray
-    ) -> Dict[str, torch.Tensor]:
-        """Process image and bounding box based on bbox_mode.
+        row: Mapping[str, str],
+        image_width: int,
+        image_height: int,
+    ) -> torch.Tensor:
+        x1 = float(row["bbox_x1"])
+        y1 = float(row["bbox_y1"])
+        x2 = float(row["bbox_x2"])
+        y2 = float(row["bbox_y2"])
 
-        Args:
-            image: PIL Image.
-            bbox: Bounding box coordinates [x1, y1, x2, y2].
+        box_w = max(x2 - x1, 1.0)
+        box_h = max(y2 - y1, 1.0)
+        center_x = (x1 + x2) * 0.5
+        center_y = (y1 + y2) * 0.5
+        mask_area = float(row["mask_area_px"])
 
-        Returns:
-            Dictionary with processed tensors.
-        """
-        orig_w, orig_h = image.size
-
-        if self.config.bbox_mode == "crop":
-            return self._process_crop_mode(image, bbox)
-        elif self.config.bbox_mode == "mask":
-            return self._process_mask_mode(image, bbox, orig_w, orig_h)
-        elif self.config.bbox_mode == "numeric":
-            return self._process_numeric_mode(image, bbox, orig_w, orig_h)
-        elif self.config.bbox_mode == "both":
-            return self._process_both_mode(image, bbox, orig_w, orig_h)
-        else:
-            raise ValueError(f"Unknown bbox_mode: {self.config.bbox_mode}")
-
-    def _process_crop_mode(
-        self,
-        image: Image.Image,
-        bbox: np.ndarray
-    ) -> Dict[str, torch.Tensor]:
-        """Crop image to bounding box region.
-
-        Args:
-            image: PIL Image.
-            bbox: Bounding box coordinates.
-
-        Returns:
-            Dictionary with cropped and resized image.
-        """
-        x1, y1, x2, y2 = bbox.astype(int)
-
-        # Add some padding around the bbox
-        pad = 10
-        x1 = max(0, x1 - pad)
-        y1 = max(0, y1 - pad)
-        x2 = min(image.width, x2 + pad)
-        y2 = min(image.height, y2 + pad)
-
-        # Crop and resize
-        cropped = image.crop((x1, y1, x2, y2))
-        resized = cropped.resize(
-            self.config.image_size,
-            Image.Resampling.BILINEAR
+        return torch.tensor(
+            [
+                center_x / max(image_width, 1),
+                center_y / max(image_height, 1),
+                box_w / max(image_width, 1),
+                box_h / max(image_height, 1),
+                mask_area / max(image_width * image_height, 1),
+            ],
+            dtype=torch.float32,
         )
 
-        # Apply transforms
-        img_tensor = self.transform(resized)
 
-        return {"image": img_tensor}
+def normalize_translation(
+    translation: torch.Tensor,
+    stats: TranslationStats,
+) -> torch.Tensor:
+    mean = torch.tensor(
+        stats.mean,
+        dtype=translation.dtype,
+        device=translation.device)
+    std = torch.tensor(
+        stats.std,
+        dtype=translation.dtype,
+        device=translation.device)
+    return (translation - mean) / std
 
-    def _process_mask_mode(
-        self,
-        image: Image.Image,
-        bbox: np.ndarray,
-        orig_w: int,
-        orig_h: int
-    ) -> Dict[str, torch.Tensor]:
-        """Create binary mask and resize full image.
 
-        Args:
-            image: PIL Image.
-            bbox: Bounding box coordinates.
-            orig_w: Original image width.
-            orig_h: Original image height.
+def denormalize_translation(
+    translation: torch.Tensor,
+    stats: TranslationStats,
+) -> torch.Tensor:
+    mean = torch.tensor(
+        stats.mean,
+        dtype=translation.dtype,
+        device=translation.device)
+    std = torch.tensor(
+        stats.std,
+        dtype=translation.dtype,
+        device=translation.device)
+    return translation * std + mean
 
-        Returns:
-            Dictionary with resized image and mask.
-        """
-        target_h, target_w = self.config.image_size
 
-        # Resize image
-        resized = image.resize(
-            (target_w, target_h), Image.Resampling.BILINEAR
-        )
-        img_tensor = self.transform(resized)
+def split_summary(
+    rows_by_split: Mapping[str, Sequence[Mapping[str, str]]],
+) -> Dict[str, Dict[str, int]]:
+    """Build a compact summary of row and frame counts per split."""
 
-        # Scale bbox to new size
-        scale_x = target_w / orig_w
-        scale_y = target_h / orig_h
-
-        x1 = int(bbox[0] * scale_x)
-        y1 = int(bbox[1] * scale_y)
-        x2 = int(bbox[2] * scale_x)
-        y2 = int(bbox[3] * scale_y)
-
-        # Create binary mask
-        mask = torch.zeros(1, target_h, target_w, dtype=torch.float32)
-        mask[0, y1:y2, x1:x2] = 1.0
-
-        # Concatenate mask as 4th channel
-        img_with_mask = torch.cat([img_tensor, mask], dim=0)
-
-        return {"image": img_with_mask, "bbox_mask": mask}
-
-    def _process_numeric_mode(
-        self,
-        image: Image.Image,
-        bbox: np.ndarray,
-        orig_w: int,
-        orig_h: int
-    ) -> Dict[str, torch.Tensor]:
-        """Resize image and provide normalized bbox coordinates.
-
-        Args:
-            image: PIL Image.
-            bbox: Bounding box coordinates.
-            orig_w: Original image width.
-            orig_h: Original image height.
-
-        Returns:
-            Dictionary with resized image and normalized bbox.
-        """
-        target_h, target_w = self.config.image_size
-
-        # Resize image
-        resized = image.resize(
-            (target_w, target_h), Image.Resampling.BILINEAR
-        )
-        img_tensor = self.transform(resized)
-
-        # Normalize bbox to [0, 1]
-        bbox_normalized = torch.tensor([
-            bbox[0] / orig_w,
-            bbox[1] / orig_h,
-            bbox[2] / orig_w,
-            bbox[3] / orig_h,
-        ], dtype=torch.float32)
-
-        return {"image": img_tensor, "bbox_normalized": bbox_normalized}
-
-    def _process_both_mode(
-        self,
-        image: Image.Image,
-        bbox: np.ndarray,
-        orig_w: int,
-        orig_h: int
-    ) -> Dict[str, torch.Tensor]:
-        """Combine mask and numeric modes.
-
-        Args:
-            image: PIL Image.
-            bbox: Bounding box coordinates.
-            orig_w: Original image width.
-            orig_h: Original image height.
-
-        Returns:
-            Dictionary with image+mask and normalized bbox.
-        """
-        mask_result = self._process_mask_mode(image, bbox, orig_w, orig_h)
-        numeric_result = self._process_numeric_mode(image, bbox, orig_w, orig_h)
-
-        return {
-            "image": mask_result["image"],
-            "bbox_mask": mask_result["bbox_mask"],
-            "bbox_normalized": numeric_result["bbox_normalized"],
+    summary: Dict[str, Dict[str, int]] = {}
+    for split_name, rows in rows_by_split.items():
+        frames = {(row["town"], row["frame_id"]) for row in rows}
+        summary[split_name] = {
+            "rows": len(rows),
+            "frames": len(frames),
         }
-
-
-def compute_pose_statistics(
-    df: pd.DataFrame,
-    use_gt: bool = True
-) -> Tuple[Tuple[float, ...], Tuple[float, ...]]:
-    """Compute mean and std of pose values from the dataset.
-
-    Args:
-        df: DataFrame with pose annotations.
-        use_gt: Whether to use GT poses or predicted poses.
-
-    Returns:
-        Tuple of (mean, std) for (dx, dy, dz, yaw).
-    """
-    prefix = "gt" if use_gt else "pred"
-
-    mean = (
-        df[f"{prefix}_dx_m"].mean(),
-        df[f"{prefix}_dy_m"].mean(),
-        df[f"{prefix}_dz_m"].mean(),
-        df[f"{prefix}_yaw_deg"].mean(),
-    )
-
-    std = (
-        df[f"{prefix}_dx_m"].std(),
-        df[f"{prefix}_dy_m"].std(),
-        df[f"{prefix}_dz_m"].std(),
-        df[f"{prefix}_yaw_deg"].std(),
-    )
-
-    return mean, std
-
-
-def create_data_splits(
-    df: pd.DataFrame,
-    config: PoseEstimationConfig
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Split dataset into train, validation, and test sets.
-
-    Splits are stratified by town to ensure balanced representation.
-
-    Args:
-        df: Full DataFrame.
-        config: Configuration with split ratios.
-
-    Returns:
-        Tuple of (train_df, val_df, test_df).
-    """
-    np.random.seed(config.random_seed)
-
-    # Get unique frame IDs (some frames may have multiple detections)
-    unique_frames = df["frame_id"].unique()
-    np.random.shuffle(unique_frames)
-
-    n_total = len(unique_frames)
-    n_train = int(n_total * config.train_ratio)
-    n_val = int(n_total * config.val_ratio)
-
-    train_frames = set(unique_frames[:n_train])
-    val_frames = set(unique_frames[n_train:n_train + n_val])
-    test_frames = set(unique_frames[n_train + n_val:])
-
-    train_df = df[df["frame_id"].isin(train_frames)].copy()
-    val_df = df[df["frame_id"].isin(val_frames)].copy()
-    test_df = df[df["frame_id"].isin(test_frames)].copy()
-
-    print("Data splits:")
-    print(f"  Train: {len(train_df)} samples ({len(train_frames)} frames)")
-    print(f"  Val:   {len(val_df)} samples ({len(val_frames)} frames)")
-    print(f"  Test:  {len(test_df)} samples ({len(test_frames)} frames)")
-
-    return train_df, val_df, test_df
+    return summary

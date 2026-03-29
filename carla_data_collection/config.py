@@ -1,4 +1,4 @@
-"""Configuration for the per-target CARLA dataset pipeline."""
+"""Configuration for the compact single-pass CARLA dataset pipeline."""
 
 from __future__ import annotations
 
@@ -10,12 +10,13 @@ from typing import Sequence, Tuple
 
 @dataclass
 class Config:
-    """Configuration shared by raw capture, dataset build, and benchmarking.
+    """Shared configuration for collection and reporting.
 
-    The pipeline is intentionally split into two stages:
+    The dataset is built in one pass:
 
-    1. Raw capture from CARLA in a CARLA-compatible Python environment.
-    2. Offline dataset building with SAM3 and the 3D detector in a modern env.
+    1. capture synchronized CARLA sensors in memory,
+    2. run SAM3 and the 3D detector immediately,
+    3. write only final RGB, masks, CSVs, and a compact frame manifest.
     """
 
     # ------------------------------------------------------------------
@@ -24,17 +25,13 @@ class Config:
     output_dir: str = "carla_dataset"
     fresh_start: bool = False
 
-    raw_subdir: str = "raw_capture"
-    raw_rgb_subdir: str = "rgb"
-    raw_lidar_subdir: str = "lidar"
-    raw_instance_subdir: str = "instance"
-    raw_metadata_subdir: str = "metadata"
-
-    final_rgb_subdir: str = "rgb"
-    final_masks_subdir: str = "masks"
+    rgb_subdir: str = "rgb"
+    masks_subdir: str = "masks"
     gt_csv_name: str = "gt_poses.csv"
     pred_csv_name: str = "pred_poses.csv"
-    benchmark_subdir: str = "benchmarks"
+    frames_manifest_name: str = "frames.jsonl"
+    collection_summary_name: str = "collection_summary.json"
+    metrics_report_name: str = "detailed_metrics.json"
 
     # ------------------------------------------------------------------
     # CARLA connection
@@ -45,7 +42,7 @@ class Config:
     client_timeout_s: float = 120.0
 
     # ------------------------------------------------------------------
-    # Capture settings
+    # Collection settings
     # ------------------------------------------------------------------
     towns: Tuple[str, ...] = ("Town01", "Town02", "Town03", "Town04", "Town05")
     target_samples_per_town: int = 3000
@@ -75,10 +72,11 @@ class Config:
     # ------------------------------------------------------------------
     # Sensor settings
     # ------------------------------------------------------------------
-    image_width: int = 1024
-    image_height: int = 1024
+    image_width: int = 768
+    image_height: int = 768
     fov: float = 90.0
     lidar_z_offset: float = 1.73
+    rgb_jpeg_quality: int = 95
 
     # ------------------------------------------------------------------
     # Capture-time visibility filters
@@ -91,7 +89,8 @@ class Config:
     instance_bbox_dilation_px: int = 4
 
     # Used to keep long-range samples from being drowned out by near traffic.
-    distance_bins_m: Tuple[float, ...] = (0.0, 5.0, 10.0, 15.0, 20.0, 30.0, 40.0)
+    distance_bins_m: Tuple[float, ...] = (
+        0.0, 5.0, 10.0, 15.0, 20.0, 30.0, 40.0)
     lateral_bins_m: Tuple[float, ...] = (0.0, 1.5, 3.5, 1000.0)
     yaw_bins_deg: Tuple[float, ...] = (0.0, 10.0, 30.0, 60.0, 120.0, 180.0)
 
@@ -107,7 +106,7 @@ class Config:
     sam3_device: str = "cuda:0"
 
     # ------------------------------------------------------------------
-    # Offline sample acceptance
+    # Sample acceptance
     # ------------------------------------------------------------------
     min_mask_area_px: int = 120
     sam3_actor_iou_thr: float = 0.15
@@ -124,7 +123,7 @@ class Config:
     detector_device: str = "cuda:0"
 
     # ------------------------------------------------------------------
-    # Benchmarking / reporting
+    # Reporting
     # ------------------------------------------------------------------
     save_reports: bool = True
 
@@ -144,36 +143,13 @@ class Config:
                 "_4x8_cyclic_20e_nus_20220810_025930-657f67e0.pth",
             )
 
-    # ------------------------------------------------------------------
-    # Directory helpers
-    # ------------------------------------------------------------------
     @property
-    def raw_capture_dir(self) -> str:
-        return os.path.join(self.output_dir, self.raw_subdir)
+    def rgb_dir(self) -> str:
+        return os.path.join(self.output_dir, self.rgb_subdir)
 
     @property
-    def raw_rgb_dir(self) -> str:
-        return os.path.join(self.raw_capture_dir, self.raw_rgb_subdir)
-
-    @property
-    def raw_lidar_dir(self) -> str:
-        return os.path.join(self.raw_capture_dir, self.raw_lidar_subdir)
-
-    @property
-    def raw_instance_dir(self) -> str:
-        return os.path.join(self.raw_capture_dir, self.raw_instance_subdir)
-
-    @property
-    def raw_metadata_dir(self) -> str:
-        return os.path.join(self.raw_capture_dir, self.raw_metadata_subdir)
-
-    @property
-    def final_rgb_dir(self) -> str:
-        return os.path.join(self.output_dir, self.final_rgb_subdir)
-
-    @property
-    def final_masks_dir(self) -> str:
-        return os.path.join(self.output_dir, self.final_masks_subdir)
+    def masks_dir(self) -> str:
+        return os.path.join(self.output_dir, self.masks_subdir)
 
     @property
     def gt_csv_path(self) -> str:
@@ -184,25 +160,23 @@ class Config:
         return os.path.join(self.output_dir, self.pred_csv_name)
 
     @property
-    def benchmark_dir(self) -> str:
-        return os.path.join(self.output_dir, self.benchmark_subdir)
+    def frames_manifest_path(self) -> str:
+        return os.path.join(self.output_dir, self.frames_manifest_name)
 
     @property
-    def capture_dirs(self) -> Sequence[str]:
-        return (
-            self.raw_capture_dir,
-            self.raw_rgb_dir,
-            self.raw_lidar_dir,
-            self.raw_instance_dir,
-            self.raw_metadata_dir,
-        )
+    def collection_summary_path(self) -> str:
+        return os.path.join(self.output_dir, self.collection_summary_name)
 
     @property
-    def final_dirs(self) -> Sequence[str]:
+    def metrics_report_path(self) -> str:
+        return os.path.join(self.output_dir, self.metrics_report_name)
+
+    @property
+    def dataset_dirs(self) -> Sequence[str]:
         return (
-            self.final_rgb_dir,
-            self.final_masks_dir,
-            self.benchmark_dir,
+            self.output_dir,
+            self.rgb_dir,
+            self.masks_dir,
         )
 
     @property

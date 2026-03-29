@@ -62,7 +62,8 @@ class VisionDetector:
         pil_image = Image.fromarray(rgb_image.astype(np.uint8), mode="RGB")
         return self.processor.set_image(pil_image)
 
-    def _results_to_candidates(self, results: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _results_to_candidates(
+            self, results: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Convert a SAM3 processor state into deduplicated mask candidates."""
         if len(results["scores"]) == 0:
             return []
@@ -88,14 +89,16 @@ class VisionDetector:
 
         return deduplicate_mask_candidates(candidates, self.duplicate_iou_thr)
 
-    def detect_and_segment(self, rgb_image: np.ndarray) -> List[Dict[str, Any]]:
+    def detect_and_segment(
+            self, rgb_image: np.ndarray) -> List[Dict[str, Any]]:
         """Return SAM3 masks, bboxes, and confidence scores for vehicles."""
         state = self.set_image(rgb_image)
         results = self.processor.set_text_prompt(self.prompt, state)
 
         if len(results["scores"]) == 0 and self.fallback_prompt:
             self.processor.reset_all_prompts(state)
-            results = self.processor.set_text_prompt(self.fallback_prompt, state)
+            results = self.processor.set_text_prompt(
+                self.fallback_prompt, state)
 
         return self._results_to_candidates(results)
 

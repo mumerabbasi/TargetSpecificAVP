@@ -323,7 +323,9 @@ class SensorManager:
         # Instance Segmentation Camera
         instance_bp = bp_lib.find("sensor.camera.instance_segmentation")
         instance_bp.set_attribute("image_size_x", str(self.config.image_width))
-        instance_bp.set_attribute("image_size_y", str(self.config.image_height))
+        instance_bp.set_attribute(
+            "image_size_y", str(
+                self.config.image_height))
         instance_bp.set_attribute("fov", str(self.config.fov))
 
         self.instance_camera = self.world.spawn_actor(
@@ -444,8 +446,10 @@ class SensorManager:
         vehicle_mask = (semantic_tags == self.VEHICLE_SEMANTIC_TAG)
 
         if debug:
-            unique_tags, tag_counts = np.unique(semantic_tags, return_counts=True)
-            print(f"[Debug] Semantic tags in image: {dict(zip(unique_tags, tag_counts))}")
+            unique_tags, tag_counts = np.unique(
+                semantic_tags, return_counts=True)
+            print(
+                f"[Debug] Semantic tags in image: {dict(zip(unique_tags, tag_counts))}")
             print(f"[Debug] Vehicle pixels (tag=14): {vehicle_mask.sum()}")
 
         if not np.any(vehicle_mask):
@@ -453,7 +457,8 @@ class SensorManager:
 
         # Get unique vehicle instance IDs
         vehicle_instance_ids = instance_ids[vehicle_mask]
-        unique_ids, counts = np.unique(vehicle_instance_ids, return_counts=True)
+        unique_ids, counts = np.unique(
+            vehicle_instance_ids, return_counts=True)
 
         vehicles = []
         for inst_id, count in zip(unique_ids, counts):
@@ -461,16 +466,22 @@ class SensorManager:
                 # Get bounding box for this instance
                 inst_mask = (instance_ids == inst_id) & vehicle_mask
                 ys, xs = np.where(inst_mask)
-                bbox = (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
-                
-                # Filter by bounding box size - vehicles should be reasonably sized
+                bbox = (int(xs.min()), int(ys.min()),
+                        int(xs.max()), int(ys.max()))
+
+                # Filter by bounding box size - vehicles should be reasonably
+                # sized
                 bbox_width = bbox[2] - bbox[0]
                 bbox_height = bbox[3] - bbox[1]
-                
+
                 if bbox_width >= min_width and bbox_height >= min_height:
                     vehicles.append((int(inst_id), int(count), bbox))
                 elif debug:
-                    print(f"[Debug] Filtered out instance {inst_id}: bbox too small ({bbox_width}x{bbox_height})")
+                    print(
+                        "[Debug] Filtered out instance "
+                        f"{inst_id}: bbox too small "
+                        f"({bbox_width}x{bbox_height})"
+                    )
 
         if debug and vehicles:
             print(f"[Debug] Found {len(vehicles)} valid vehicles:")
@@ -502,7 +513,8 @@ class SensorManager:
         Returns:
             Instance ID of selected vehicle, or None if no vehicle found.
         """
-        vehicles = self.find_vehicle_instances(instance_image, min_pixels, debug=debug)
+        vehicles = self.find_vehicle_instances(
+            instance_image, min_pixels, debug=debug)
 
         if not vehicles:
             return None
@@ -513,7 +525,9 @@ class SensorManager:
                 if inst_id == self.tracked_instance_id:
                     return inst_id
             # Tracked vehicle not visible - don't switch, return None
-            print(f"[Tracking] Lost track of instance {self.tracked_instance_id}")
+            print(
+                f"[Tracking] Lost track of instance {
+                    self.tracked_instance_id}")
             return None
 
         # No tracking initialized - select center vehicle as fallback
@@ -534,7 +548,8 @@ class SensorManager:
         if best_vehicle is not None:
             self.tracked_instance_id = best_vehicle[0]
             print(
-                f"[Tracking] Fallback: selected center vehicle {self.tracked_instance_id} "
+                "[Tracking] Fallback: selected center vehicle "
+                f"{self.tracked_instance_id} "
                 f"({best_vehicle[1]} pixels)"
             )
             return self.tracked_instance_id
@@ -613,7 +628,8 @@ class SensorManager:
         debug = (self.tracked_instance_id is None)
 
         # Select target vehicle
-        target_id = self.select_target_vehicle(instance_image, min_pixels, debug=debug)
+        target_id = self.select_target_vehicle(
+            instance_image, min_pixels, debug=debug)
 
         if target_id is None:
             if debug:
@@ -637,9 +653,9 @@ class SensorManager:
         x_min, x_max = xs.min(), xs.max()
         y_min, y_max = ys.min(), ys.max()
 
-        # Create filled bounding box mask (like training bbox_mode="mask")
+        # Create a filled target mask for the pose model input.
         bbox_mask = np.zeros((height, width), dtype=np.uint8)
-        bbox_mask[y_min:y_max+1, x_min:x_max+1] = 1
+        bbox_mask[y_min:y_max + 1, x_min:x_max + 1] = 1
 
         return bbox_mask, target_id
 
@@ -742,7 +758,9 @@ class SpectatorManager:
         )
         self.camera.listen(self.image_queue.put)
 
-        print(f"[CARLA] Spectator camera attached to target {target.id}, facing ego")
+        print(
+            f"[CARLA] Spectator camera attached to target {
+                target.id}, facing ego")
 
     def update(
         self,
@@ -767,7 +785,8 @@ class SpectatorManager:
         target_yaw = math.radians(target_tf.rotation.yaw)
 
         # Position in front of target (between target and ego)
-        # Since ego is behind target, we go in the opposite direction of target's heading
+        # Since ego is behind target, we go in the opposite direction of
+        # target's heading
         dx = self.distance * math.cos(target_yaw)
         dy = self.distance * math.sin(target_yaw)
 
@@ -1082,7 +1101,8 @@ def get_all_vehicle_masks(
         Dict mapping instance_id -> binary bbox mask (HxW).
     """
     height, width = instance_image.shape[:2]
-    vehicles = sensor_manager.find_vehicle_instances(instance_image, min_pixels)
+    vehicles = sensor_manager.find_vehicle_instances(
+        instance_image, min_pixels)
 
     masks = {}
     semantic_tags = sensor_manager._get_semantic_tags(instance_image)

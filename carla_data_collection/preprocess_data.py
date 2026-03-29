@@ -43,6 +43,8 @@ CSV_FIELDNAMES = [
     "dy_m",
     "dz_m",
     "yaw_deg",
+    "yaw_follow_deg",
+    "follow_valid",
     "pose_score",
 ]
 
@@ -62,9 +64,13 @@ def _discover_dataset_roots(source_root: str, dest_root: str) -> List[str]:
             continue
         if os.path.abspath(path) == os.path.abspath(dest_root):
             continue
-        if os.path.exists(os.path.join(path, "gt_poses.csv")) or os.path.exists(
-            os.path.join(path, "pred_poses.csv")
-        ):
+        if os.path.exists(
+            os.path.join(
+                path,
+                "gt_poses.csv")) or os.path.exists(
+            os.path.join(
+                path,
+                "pred_poses.csv")):
             datasets.append(path)
     return datasets
 
@@ -113,18 +119,27 @@ def combine_datasets(source_root: str, dest_root: str) -> Tuple[int, int, int]:
 
     for dataset_root in dataset_roots:
         gt_rows = _read_csv_rows(os.path.join(dataset_root, "gt_poses.csv"))
-        pred_rows = _read_csv_rows(os.path.join(dataset_root, "pred_poses.csv"))
-        grouped_frames = _collect_unique_frames({"gt": gt_rows, "pred": pred_rows})
+        pred_rows = _read_csv_rows(
+            os.path.join(
+                dataset_root,
+                "pred_poses.csv"))
+        grouped_frames = _collect_unique_frames(
+            {"gt": gt_rows, "pred": pred_rows})
         rgb_mapping: Dict[str, Tuple[int, str]] = {}
 
-        for old_rgb_rel in sorted(grouped_frames.keys()):
-            src_rgb = os.path.join(dataset_root, old_rgb_rel)
-            _, ext = os.path.splitext(old_rgb_rel)
+        for source_rgb_rel in sorted(grouped_frames.keys()):
+            src_rgb = os.path.join(dataset_root, source_rgb_rel)
+            _, ext = os.path.splitext(source_rgb_rel)
             if not ext:
                 ext = ".png"
-            new_rgb_rel = os.path.join("rgb", f"frame_{next_frame_id:06d}{ext}")
+            new_rgb_rel = os.path.join(
+                "rgb", f"frame_{
+                    next_frame_id:06d}{ext}")
             _copy_once(src_rgb, os.path.join(dest_root, new_rgb_rel))
-            rgb_mapping[old_rgb_rel] = (next_frame_id, new_rgb_rel.replace(os.sep, "/"))
+            rgb_mapping[source_rgb_rel] = (
+                next_frame_id,
+                new_rgb_rel.replace(os.sep, "/"),
+            )
             next_frame_id += 1
 
         for rows, target in (

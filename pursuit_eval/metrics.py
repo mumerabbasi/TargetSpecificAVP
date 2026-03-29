@@ -44,19 +44,43 @@ class PursuitMetrics:
     def add_row(self, row: Dict[str, object]) -> None:
         self.rows.append(dict(row))
 
-    def _pose_summary(self, rows: List[Dict[str, object]]) -> Dict[str, object]:
-        pose_rows = [row for row in rows if bool(row.get("pose_available", False))]
-        fresh_rows = [row for row in pose_rows if not bool(row.get("pose_stale", False))]
-        mask_rows = [row for row in rows if bool(row.get("mask_available", False))]
-        detector_rows = [row for row in rows if bool(row.get("detector_pose_available", False))]
-        reseed_rows = [row for row in rows if bool(row.get("bbox_reseed_used", False))]
+    def _pose_summary(
+            self, rows: List[Dict[str, object]]) -> Dict[str, object]:
+        pose_rows = [
+            row for row in rows if bool(
+                row.get(
+                    "pose_available",
+                    False))]
+        fresh_rows = [
+            row for row in pose_rows if not bool(
+                row.get(
+                    "pose_stale",
+                    False))]
+        mask_rows = [
+            row for row in rows if bool(
+                row.get(
+                    "mask_available",
+                    False))]
+        detector_rows = [
+            row for row in rows if bool(
+                row.get(
+                    "detector_pose_available",
+                    False))]
+        reseed_rows = [
+            row for row in rows if bool(
+                row.get(
+                    "bbox_reseed_used",
+                    False))]
 
-        def summarize_pose(subset: List[Dict[str, object]]) -> Dict[str, object]:
+        def summarize_pose(
+                subset: List[Dict[str, object]]) -> Dict[str, object]:
             dx_abs = [abs(float(row["pose_dx_error_m"])) for row in subset]
             dy_abs = [abs(float(row["pose_dy_error_m"])) for row in subset]
             yaw_abs = [abs(float(row["pose_yaw_error_deg"])) for row in subset]
-            yaw180_abs = [float(row["pose_yaw_mod_180_error_deg"]) for row in subset]
-            yaw_follow_abs = [float(row["pose_follow_yaw_error_deg"]) for row in subset]
+            yaw180_abs = [float(row["pose_yaw_mod_180_error_deg"])
+                          for row in subset]
+            yaw_follow_abs = [float(row["pose_follow_yaw_error_deg"])
+                              for row in subset]
             mask_ious = [
                 float(row["mask_iou"])
                 for row in subset
@@ -99,7 +123,8 @@ class PursuitMetrics:
             "fresh_pose_frames": summarize_pose(fresh_rows),
         }
 
-    def _pursuit_summary(self, rows: List[Dict[str, object]]) -> Dict[str, object]:
+    def _pursuit_summary(
+            self, rows: List[Dict[str, object]]) -> Dict[str, object]:
         distance_abs = [abs(float(row["distance_error_m"])) for row in rows]
         distance_signed = [float(row["distance_error_m"]) for row in rows]
         lateral_abs = [abs(float(row["gt_dy_m"])) for row in rows]
@@ -115,7 +140,8 @@ class PursuitMetrics:
         steer_delta = []
         brake_delta = []
         for prev, cur in zip(rows[:-1], rows[1:]):
-            throttle_delta.append(abs(float(cur["throttle"]) - float(prev["throttle"])))
+            throttle_delta.append(
+                abs(float(cur["throttle"]) - float(prev["throttle"])))
             steer_delta.append(abs(float(cur["steer"]) - float(prev["steer"])))
             brake_delta.append(abs(float(cur["brake"]) - float(prev["brake"])))
 
@@ -131,14 +157,24 @@ class PursuitMetrics:
             "lateral_error_abs_m": _stats(lateral_abs),
             "follow_yaw_abs_deg": _stats(follow_yaw_abs),
             "within_follow_band_ratio": within_band_ratio,
-            "first_capture_frame": int(first_capture_frame) if first_capture_frame is not None else -1,
+            "first_capture_frame": (
+                int(first_capture_frame)
+                if first_capture_frame is not None
+                else -1
+            ),
             "offroad_ratio": offroad_ratio,
-            "collision_count": int(sum(int(row["collision_events"]) for row in rows)),
+            "collision_count": int(
+                sum(int(row["collision_events"]) for row in rows)
+            ),
             "control_delta_throttle": _stats(throttle_delta),
             "control_delta_steer": _stats(steer_delta),
             "control_delta_brake": _stats(brake_delta),
-            "ego_speed_mps": _stats([float(row["ego_speed_mps"]) for row in rows]),
-            "target_speed_mps": _stats([float(row["target_speed_mps"]) for row in rows]),
+            "ego_speed_mps": _stats(
+                [float(row["ego_speed_mps"]) for row in rows]
+            ),
+            "target_speed_mps": _stats(
+                [float(row["target_speed_mps"]) for row in rows]
+            ),
         }
 
     def summarize(self, completion_reason: str) -> Dict[str, object]:
@@ -194,7 +230,11 @@ def build_frame_metrics_row(
         "dy_m": gt_pose["dy_m"],
         "yaw_deg": gt_pose["yaw_deg"],
     }
-    pose_yaw_error = wrap_angle_deg(float(used_pose["yaw_deg"]) - float(gt_pose["yaw_deg"]))
+    pose_yaw_error = wrap_angle_deg(
+        float(
+            used_pose["yaw_deg"]) -
+        float(
+            gt_pose["yaw_deg"]))
 
     return {
         "frame": int(frame_idx),
@@ -209,8 +249,12 @@ def build_frame_metrics_row(
         "bbox_reseed_requested": bool(bbox_reseed_requested),
         "bbox_reseed_used": bool(bbox_reseed_used),
         "bbox_reseed_reason": str(bbox_reseed_reason),
-        "tracker_logit_max": None if tracker_logit_max is None else float(tracker_logit_max),
-        "tracker_threshold": None if tracker_threshold is None else float(tracker_threshold),
+        "tracker_logit_max": (
+            None if tracker_logit_max is None else float(tracker_logit_max)
+        ),
+        "tracker_threshold": (
+            None if tracker_threshold is None else float(tracker_threshold)
+        ),
         "gt_dx_m": float(gt_pose["dx_m"]),
         "gt_dy_m": float(gt_pose["dy_m"]),
         "gt_yaw_deg": float(gt_pose["yaw_deg"]),

@@ -55,7 +55,8 @@ def configure_traffic_manager(
     return traffic_manager
 
 
-def _choose_vehicle_blueprints(world: carla.World) -> list[carla.ActorBlueprint]:
+def _choose_vehicle_blueprints(
+        world: carla.World) -> list[carla.ActorBlueprint]:
     vehicle_bps = world.get_blueprint_library().filter("vehicle.*")
     preferred = [
         bp
@@ -124,7 +125,8 @@ def spawn_background_traffic(
         for spawn_point in spawn_points[:num_vehicles]:
             blueprint = random.choice(blueprints)
             if blueprint.has_attribute("color"):
-                color = random.choice(blueprint.get_attribute("color").recommended_values)
+                color = random.choice(
+                    blueprint.get_attribute("color").recommended_values)
                 blueprint.set_attribute("color", color)
             blueprint.set_attribute("role_name", "autopilot")
             batch.append(
@@ -143,7 +145,8 @@ def spawn_background_traffic(
     for spawn_point in spawn_points[:num_vehicles]:
         blueprint = random.choice(blueprints)
         if blueprint.has_attribute("color"):
-            color = random.choice(blueprint.get_attribute("color").recommended_values)
+            color = random.choice(
+                blueprint.get_attribute("color").recommended_values)
             blueprint.set_attribute("color", color)
         blueprint.set_attribute("role_name", "constant_velocity")
         vehicle = world.try_spawn_actor(blueprint, spawn_point)
@@ -180,7 +183,11 @@ class SensorSnapshot:
 class SensorRig:
     """Synchronized RGB, instance, and LiDAR sensors attached to ego."""
 
-    def __init__(self, world: carla.World, ego: carla.Vehicle, config: Config) -> None:
+    def __init__(
+            self,
+            world: carla.World,
+            ego: carla.Vehicle,
+            config: Config) -> None:
         self.world = world
         self.ego = ego
         self.config = config
@@ -217,7 +224,8 @@ class SensorRig:
         lidar_bp.set_attribute("dropoff_intensity_limit", "1.0")
         lidar_bp.set_attribute("dropoff_zero_intensity", "0.0")
 
-        self.rgb_camera = world.spawn_actor(rgb_bp, camera_transform, attach_to=ego)
+        self.rgb_camera = world.spawn_actor(
+            rgb_bp, camera_transform, attach_to=ego)
         self.instance_camera = world.spawn_actor(
             instance_bp, camera_transform, attach_to=ego
         )
@@ -227,7 +235,8 @@ class SensorRig:
             carla.Rotation(pitch=0.0, yaw=0.0, roll=0.0),
         )
         self.lidar_transform_local = lidar_transform
-        self.lidar_sensor = world.spawn_actor(lidar_bp, lidar_transform, attach_to=ego)
+        self.lidar_sensor = world.spawn_actor(
+            lidar_bp, lidar_transform, attach_to=ego)
 
         self.rgb_camera.listen(self.rgb_queue.put)
         self.instance_camera.listen(self.instance_queue.put)
@@ -254,7 +263,8 @@ class SensorRig:
         }
 
         while True:
-            frames = {name: int(packet.frame) for name, packet in packets.items()}
+            frames = {name: int(packet.frame)
+                      for name, packet in packets.items()}
             if len(set(frames.values())) == 1:
                 break
 
@@ -273,7 +283,8 @@ class SensorRig:
         rgb = parse_rgb_image(rgb_raw)
         instance = parse_instance_image(instance_raw)
         lidar = parse_lidar_measurement(lidar_raw)
-        camera_world_matrix = np.array(self.rgb_camera.get_transform().get_matrix())
+        camera_world_matrix = np.array(
+            self.rgb_camera.get_transform().get_matrix())
         intrinsic = get_camera_intrinsic(
             self.config.image_width,
             self.config.image_height,
@@ -290,13 +301,18 @@ class SensorRig:
         )
 
     def destroy(self) -> None:
-        for sensor in (self.rgb_camera, self.instance_camera, self.lidar_sensor):
+        for sensor in (
+                self.rgb_camera,
+                self.instance_camera,
+                self.lidar_sensor):
             if sensor is not None:
                 sensor.stop()
                 sensor.destroy()
 
 
-def destroy_actors(world: carla.World, actors_or_ids: Sequence[object]) -> None:
+def destroy_actors(
+        world: carla.World,
+        actors_or_ids: Sequence[object]) -> None:
     """Safely destroy actors represented either as ids or actor objects."""
     for item in actors_or_ids:
         actor = item
@@ -367,20 +383,34 @@ def vehicle_instance_mask(
     """Return a binary mask for one vehicle instance."""
     semantic_tags = get_semantic_tags(instance_image)
     instance_ids = get_instance_ids(instance_image)
-    return (semantic_tags == vehicle_semantic_tag) & (instance_ids == instance_id)
+    return (
+        semantic_tags == vehicle_semantic_tag) & (
+        instance_ids == instance_id)
 
 
 def _location_to_dict(location: carla.Location) -> Dict[str, float]:
-    return {"x": float(location.x), "y": float(location.y), "z": float(location.z)}
+    return {
+        "x": float(
+            location.x), "y": float(
+            location.y), "z": float(
+                location.z)}
 
 
 def _velocity_to_dict(velocity: carla.Vector3D) -> Dict[str, float]:
-    return {"x": float(velocity.x), "y": float(velocity.y), "z": float(velocity.z)}
+    return {
+        "x": float(
+            velocity.x), "y": float(
+            velocity.y), "z": float(
+                velocity.z)}
 
 
 def speed_mps(actor: carla.Vehicle) -> float:
     velocity = actor.get_velocity()
-    return float(math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2))
+    return float(
+        math.sqrt(
+            velocity.x ** 2 +
+            velocity.y ** 2 +
+            velocity.z ** 2))
 
 
 def project_actor_bbox(
@@ -391,7 +421,8 @@ def project_actor_bbox(
     img_height: int,
 ) -> Optional[Tuple[int, int, int, int]]:
     """Project an actor 3D bounding box into image space."""
-    world_vertices = actor.bounding_box.get_world_vertices(actor.get_transform())
+    world_vertices = actor.bounding_box.get_world_vertices(
+        actor.get_transform())
     world_points = np.asarray(
         [[vertex.x, vertex.y, vertex.z] for vertex in world_vertices],
         dtype=np.float64,
@@ -433,9 +464,10 @@ def infer_actor_instance_id(
     semantic_tags = get_semantic_tags(instance_image)
     instance_ids = get_instance_ids(instance_image)
 
-    crop_semantic = semantic_tags[y1 : y2 + 1, x1 : x2 + 1]
-    crop_instances = instance_ids[y1 : y2 + 1, x1 : x2 + 1]
-    vehicle_pixels = crop_instances[crop_semantic == config.vehicle_semantic_tag]
+    crop_semantic = semantic_tags[y1: y2 + 1, x1: x2 + 1]
+    crop_instances = instance_ids[y1: y2 + 1, x1: x2 + 1]
+    vehicle_pixels = crop_instances[crop_semantic ==
+                                    config.vehicle_semantic_tag]
 
     if vehicle_pixels.size == 0:
         return None
@@ -497,7 +529,8 @@ def collect_visible_vehicle_records(
     for actor in world.get_actors().filter("vehicle.*"):
         if actor.id == ego.id or not actor.is_alive:
             continue
-        if actor.get_location().distance(ego_tf.location) > config.nearby_vehicle_radius_m:
+        if actor.get_location().distance(
+                ego_tf.location) > config.nearby_vehicle_radius_m:
             continue
 
         projected_bbox = project_actor_bbox(
@@ -543,7 +576,9 @@ def collect_visible_vehicle_records(
             "bbox_y1": int(bbox[1]),
             "bbox_x2": int(bbox[2]),
             "bbox_y2": int(bbox[3]),
-            "distance_bin": int(distance_bin_index(pose["dx_m"], config.distance_bins_m)),
+            "distance_bin": int(
+                distance_bin_index(pose["dx_m"], config.distance_bins_m)
+            ),
             "speed_mps": speed_mps(actor),
             "location": _location_to_dict(actor_tf.location),
             "rotation_yaw_deg": float(actor_tf.rotation.yaw),

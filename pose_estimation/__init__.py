@@ -1,25 +1,33 @@
-"""Pose estimation module for predicting vehicle poses from RGB images."""
+"""Mask-conditioned target pose learning."""
 
 from .config import PoseEstimationConfig
 from .dataset import (
     PoseEstimationDataset,
-    compute_pose_statistics,
-    create_data_splits,
+    TranslationStats,
+    build_frame_splits,
+    denormalize_translation,
+    load_pose_rows,
+    normalize_translation,
+    split_summary,
 )
 from .model import (
     PoseEstimationCNN,
     PoseEstimationLoss,
-    PoseEstimationMetrics,
-    create_model,
+    compute_pose_metrics,
+    decode_predictions,
 )
 
 __all__ = [
     "PoseEstimationConfig",
     "PoseEstimationDataset",
+    "TranslationStats",
+    "build_frame_splits",
+    "denormalize_translation",
+    "load_pose_rows",
+    "normalize_translation",
+    "split_summary",
     "PoseEstimationCNN",
     "PoseEstimationLoss",
-    "PoseEstimationMetrics",
-    "compute_pose_statistics",
-    "create_data_splits",
-    "create_model",
+    "compute_pose_metrics",
+    "decode_predictions",
 ]

@@ -120,7 +120,8 @@ class MPCController:
         # Low-pass filter coefficient from config
         self.steer_filter_alpha = config.steer_filter_alpha
 
-        # Warm start storage (flat array: [acc_0, steer_0, acc_1, steer_1, ...])
+        # Warm start storage (flat array: [acc_0, steer_0, acc_1, steer_1,
+        # ...])
         self.u_prev = np.zeros(self.horizon * 2)
 
         # Previous steering command for filtering
@@ -157,7 +158,8 @@ class MPCController:
         ref_velocity = target_velocity
 
         # Reference vector [x, y, psi, v]
-        ref_state = np.array([ref_x, target_y_std, target_yaw_rad, ref_velocity])
+        ref_state = np.array(
+            [ref_x, target_y_std, target_yaw_rad, ref_velocity])
 
         # Define bounds for optimization
         bounds = []
@@ -205,9 +207,14 @@ class MPCController:
             brake_cmd = abs(optimal_accel) / abs(self.max_decel)
 
         # Apply safety limits
-        throttle_cmd = float(np.clip(throttle_cmd, 0.0, self.config.max_throttle))
+        throttle_cmd = float(
+            np.clip(
+                throttle_cmd,
+                0.0,
+                self.config.max_throttle))
         brake_cmd = float(np.clip(brake_cmd, 0.0, self.config.max_brake))
-        steer_cmd = float(np.clip(steer_cmd, -self.config.max_steer, self.config.max_steer))
+        steer_cmd = float(np.clip(steer_cmd, -
+                                  self.config.max_steer, self.config.max_steer))
 
         # Emergency brake if too close
         if target_pose.dx < self.config.collision_distance:
@@ -215,10 +222,10 @@ class MPCController:
 
         # Gradual slowdown if approaching collision distance
         if target_pose.dx < self.config.slowdown_distance:
-            slowdown_factor = (
-                (target_pose.dx - self.config.collision_distance)
-                / (self.config.slowdown_distance - self.config.collision_distance)
-            )
+            slowdown_factor = ((target_pose.dx -
+                                self.config.collision_distance) /
+                               (self.config.slowdown_distance -
+                                self.config.collision_distance))
             throttle_cmd *= slowdown_factor
             brake_cmd = max(brake_cmd, 0.3 * (1 - slowdown_factor))
 

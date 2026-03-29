@@ -105,7 +105,8 @@ def _label_value_bin(value: float, bin_edges: List[float]) -> str:
     for idx in range(len(bin_edges) - 1):
         lower = bin_edges[idx]
         upper = bin_edges[idx + 1]
-        upper_cmp = value <= upper if idx == len(bin_edges) - 2 else value < upper
+        upper_cmp = value <= upper if idx == len(
+            bin_edges) - 2 else value < upper
         if lower <= value and upper_cmp:
             upper_label = "inf" if math.isinf(upper) else f"{upper:g}"
             return f"{lower:g}-{upper_label}"
@@ -146,12 +147,14 @@ def _summarize_matches(
             continue
 
         group["matched_samples"] += 1
-        group["dx_abs"].append(abs(float(pred_row["dx_m"]) - float(gt_row["dx_m"])))
-        group["dy_abs"].append(abs(float(pred_row["dy_m"]) - float(gt_row["dy_m"])))
-        group["dz_abs"].append(abs(float(pred_row["dz_m"]) - float(gt_row["dz_m"])))
-        group["yaw_abs"].append(
-            abs(float(wrap_angle_deg(float(pred_row["yaw_deg"]) - float(gt_row["yaw_deg"]))))
-        )
+        group["dx_abs"].append(
+            abs(float(pred_row["dx_m"]) - float(gt_row["dx_m"])))
+        group["dy_abs"].append(
+            abs(float(pred_row["dy_m"]) - float(gt_row["dy_m"])))
+        group["dz_abs"].append(
+            abs(float(pred_row["dz_m"]) - float(gt_row["dz_m"])))
+        group["yaw_abs"].append(abs(float(wrap_angle_deg(
+            float(pred_row["yaw_deg"]) - float(gt_row["yaw_deg"])))))
         group["yaw_mod_180_abs"].append(
             _wrap_yaw_mod_180_deg(
                 float(pred_row["yaw_deg"]),
@@ -203,8 +206,12 @@ def _dataset_summary(
         "pred_frames": len(pred_per_frame),
         "gt_samples": len(gt_rows),
         "pred_samples": len(pred_rows),
-        "avg_gt_targets_per_frame": float(len(gt_rows) / max(len(gt_per_frame), 1)),
-        "avg_pred_targets_per_frame": float(len(pred_rows) / max(len(pred_per_frame), 1)),
+        "avg_gt_targets_per_frame": float(
+            len(gt_rows) / max(len(gt_per_frame), 1)
+        ),
+        "avg_pred_targets_per_frame": float(
+            len(pred_rows) / max(len(pred_per_frame), 1)
+        ),
         "max_gt_targets_in_frame": int(max(gt_per_frame.values(), default=0)),
         "max_pred_targets_in_frame": int(max(pred_per_frame.values(), default=0)),
         "gt_targets_per_frame_histogram": {
@@ -215,7 +222,9 @@ def _dataset_summary(
             str(key): int(value)
             for key, value in sorted(Counter(pred_per_frame.values()).items())
         },
-        "gt_samples_by_town": {town: int(count) for town, count in sorted(gt_by_town.items())},
+        "gt_samples_by_town": {
+            town: int(count) for town, count in sorted(gt_by_town.items())
+        },
         "pred_samples_by_town": {
             town: int(count) for town, count in sorted(pred_by_town.items())
         },
@@ -257,13 +266,19 @@ def write_detailed_metrics_report(config: Config) -> str:
             gt_rows,
             pred_rows,
             group_name="distance_bin_m",
-            group_key_fn=lambda row: _label_value_bin(float(row["dx_m"]), distance_bins),
+            group_key_fn=lambda row: _label_value_bin(
+                float(row["dx_m"]),
+                distance_bins,
+            ),
         ),
         "by_mask_area_bin": _summarize_matches(
             gt_rows,
             pred_rows,
             group_name="mask_area_px",
-            group_key_fn=lambda row: _label_value_bin(float(row["mask_area_px"]), area_bins),
+            group_key_fn=lambda row: _label_value_bin(
+                float(row["mask_area_px"]),
+                area_bins,
+            ),
         ),
         "by_abs_yaw_follow_bin": _summarize_matches(
             gt_rows,
@@ -276,8 +291,8 @@ def write_detailed_metrics_report(config: Config) -> str:
         ),
     }
 
-    os.makedirs(config.benchmark_dir, exist_ok=True)
-    out_path = os.path.join(config.benchmark_dir, "detailed_metrics.json")
+    os.makedirs(config.output_dir, exist_ok=True)
+    out_path = config.metrics_report_path
     with open(out_path, "w") as f:
         json.dump(report, f, indent=2)
     return out_path

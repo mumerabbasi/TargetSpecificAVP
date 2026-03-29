@@ -83,8 +83,12 @@ class MPCFollower:
 
         bounds = []
         for _ in range(self.horizon):
-            bounds.append((float(self.config.max_decel), float(self.config.max_accel)))
-            bounds.append((-float(self.config.max_steer_rad), float(self.config.max_steer_rad)))
+            bounds.append(
+                (float(
+                    self.config.max_decel), float(
+                    self.config.max_accel)))
+            bounds.append((-float(self.config.max_steer_rad),
+                          float(self.config.max_steer_rad)))
 
         u_init = np.roll(self.prev_solution, -2)
         accel_seed = self._initial_accel_seed(target_pose, vehicle_state)
@@ -131,27 +135,28 @@ class MPCFollower:
         else:
             brake = abs(accel) / abs(float(self.config.max_decel))
 
-        throttle = float(np.clip(throttle, 0.0, float(self.config.max_throttle)))
+        throttle = float(
+            np.clip(
+                throttle, 0.0, float(
+                    self.config.max_throttle)))
         brake = float(np.clip(brake, 0.0, float(self.config.max_brake)))
-        steer_cmd = float(np.clip(steer_cmd, -float(self.config.max_steer), float(self.config.max_steer)))
+        steer_cmd = float(
+            np.clip(
+                steer_cmd, -float(self.config.max_steer),
+                float(self.config.max_steer)))
 
-        if (
-            throttle > 0.0
-            and float(vehicle_state.speed_mps) < float(self.config.launch_speed_threshold_mps)
-        ):
+        if (throttle > 0.0 and float(vehicle_state.speed_mps)
+                < float(self.config.launch_speed_threshold_mps)):
             throttle = max(throttle, float(self.config.launch_throttle_floor))
 
         if float(target_pose.dx_m) < float(self.config.collision_distance_m):
             return ControlCommand(throttle=0.0, steer=steer_cmd, brake=1.0)
 
         if float(target_pose.dx_m) < float(self.config.slowdown_distance_m):
-            denom = max(
-                float(self.config.slowdown_distance_m) - float(self.config.collision_distance_m),
-                1e-6,
-            )
-            factor = (
-                float(target_pose.dx_m) - float(self.config.collision_distance_m)
-            ) / denom
+            denom = max(float(self.config.slowdown_distance_m) -
+                        float(self.config.collision_distance_m), 1e-6, )
+            factor = (float(target_pose.dx_m) -
+                      float(self.config.collision_distance_m)) / denom
             factor = float(np.clip(factor, 0.0, 1.0))
             throttle *= factor
             brake = max(brake, 0.3 * (1.0 - factor))
@@ -163,18 +168,35 @@ class MPCFollower:
         target_pose: RelativeTargetPose,
         vehicle_state: VehicleState,
     ) -> float:
-        gap_error_m = float(target_pose.dx_m) - float(self.config.desired_distance_m)
-        speed_error_mps = float(target_pose.target_speed_mps) - float(vehicle_state.speed_mps)
+        gap_error_m = float(target_pose.dx_m) - \
+            float(self.config.desired_distance_m)
+        speed_error_mps = float(
+            target_pose.target_speed_mps) - float(vehicle_state.speed_mps)
         accel_seed = 0.8 * gap_error_m + 1.2 * speed_error_mps
-        return float(np.clip(accel_seed, float(self.config.max_decel), float(self.config.max_accel)))
+        return float(
+            np.clip(
+                accel_seed, float(
+                    self.config.max_decel), float(
+                    self.config.max_accel)))
 
     def _initial_steer_seed(self, target_pose: RelativeTargetPose) -> float:
         yaw_term = math.radians(float(target_pose.yaw_deg))
-        lateral_term = math.atan2(float(target_pose.dy_m), max(float(target_pose.dx_m), 1e-3))
+        lateral_term = math.atan2(
+            float(
+                target_pose.dy_m), max(
+                float(
+                    target_pose.dx_m), 1e-3))
         steer_seed = yaw_term + 0.8 * lateral_term
-        return float(np.clip(steer_seed, -float(self.config.max_steer_rad), float(self.config.max_steer_rad)))
+        return float(
+            np.clip(
+                steer_seed, -float(self.config.max_steer_rad),
+                float(self.config.max_steer_rad)))
 
-    def _relative_model(self, state: np.ndarray, control: np.ndarray, target_speed_mps: float) -> np.ndarray:
+    def _relative_model(
+            self,
+            state: np.ndarray,
+            control: np.ndarray,
+            target_speed_mps: float) -> np.ndarray:
         dx_m, dy_m, yaw_rel_rad, ego_speed_mps = state
         accel, steer = control
         ego_yaw_rate = 0.0
@@ -193,7 +215,8 @@ class MPCFollower:
         next_yaw = yaw_rel_rad - ego_yaw_rate * self.dt
         next_yaw = (next_yaw + math.pi) % (2.0 * math.pi) - math.pi
         next_speed = max(0.0, ego_speed_mps + accel * self.dt)
-        return np.array([next_dx, next_dy, next_yaw, next_speed], dtype=np.float64)
+        return np.array([next_dx, next_dy, next_yaw,
+                        next_speed], dtype=np.float64)
 
     def _cost_function(
         self,
@@ -204,7 +227,9 @@ class MPCFollower:
     ) -> float:
         cost = 0.0
         state = x0.copy()
-        controls = np.asarray(u_flat, dtype=np.float64).reshape((self.horizon, 2))
+        controls = np.asarray(
+            u_flat, dtype=np.float64).reshape(
+            (self.horizon, 2))
         prev_u = np.zeros(2, dtype=np.float64)
 
         for step in range(self.horizon):

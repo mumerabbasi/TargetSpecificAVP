@@ -84,7 +84,8 @@ class MMDet3DDetector:
             if "not implemented on CPU" in message:
                 raise RuntimeError(
                     "The configured 3D detector requires CUDA-visible GPUs for "
-                    "inference. Make sure the detector env can see NVIDIA devices."
+                    "inference. Make sure the detector env can see NVIDIA "
+                    "devices."
                 ) from exc
             raise
         det_sample = extract_data_sample(det_output)
@@ -94,9 +95,15 @@ class MMDet3DDetector:
         scores_3d = pred.scores_3d.cpu().numpy()
         labels_3d = pred.labels_3d.cpu().numpy()
 
-        class_names = getattr(self.model, "dataset_meta", {}).get("classes", None)
+        class_names = getattr(
+            self.model,
+            "dataset_meta",
+            {}).get(
+            "classes",
+            None)
         if class_names is not None:
-            car_ids = [idx for idx, name in enumerate(class_names) if name.lower() == "car"]
+            car_ids = [idx for idx, name in enumerate(
+                class_names) if name.lower() == "car"]
             if car_ids:
                 mask_cls = np.isin(labels_3d, car_ids)
                 bboxes_3d = bboxes_3d[mask_cls]

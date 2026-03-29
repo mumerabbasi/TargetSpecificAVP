@@ -1,354 +1,242 @@
 # RAVP
 
-RAVP is a CARLA-based pipeline for learning relative target-vehicle pose from ego-view images and using that estimate inside a pursuit controller.
+RAVP is a CARLA-based pipeline for learning the relative pose of one target car from:
 
-The core idea is:
+- one ego RGB image
+- one mask for the target car
 
-1. collect rich supervision offline in CARLA,
-2. train a much cheaper online pose model,
-3. feed that pose estimate to downstream control.
+The downstream contract is explicit:
 
-The collection stack has now been redesigned around the exact downstream contract:
+- input to the pose model: `rgb + target_mask`
+- output from the pose model: `dx_m, dy_m, dz_m, yaw_follow_deg`
 
-- input to the future CNN: one ego RGB frame plus one target-car mask,
-- output from the CNN: the pose of that masked car only.
+The repository uses one compact dataset pipeline and one canonical Python env.
 
-So the dataset is now explicitly per-target, not per-frame.
+## Current design
 
-## Current status
+The primary workflow is:
 
-The data-collection side is the most up-to-date part of the repository.
+1. start CARLA under a watchdog
+2. run `collect-dataset` in `ravp`
+3. for each accepted frame, generate final RGB, SAM3 masks, GT poses, and detector poses immediately
+4. save only the final dataset assets
 
-- `carla_data_collection/` now builds a per-target mask-conditioned dataset.
-- `pose_estimation/` and `inference/` still contain older bbox-oriented assumptions in some places.
-- The new collector already emits the assets needed for a mask-conditioned training pipeline:
-  - shared ego RGB frames,
-  - one mask per visible target vehicle,
-  - separate GT and predicted pose CSVs.
+The default workflow writes the final training dataset directly.
 
-## End-to-end pipeline
+## Canonical env
 
-### Stage A: raw traffic capture
+Use `ravp` for:
 
-Raw capture is done in continuous CARLA traffic rather than by spawning isolated target scenes.
+- CARLA client code
+- SAM3
+- MMDetection3D / detector inference
+- dataset collection
+- pursuit evaluation
 
-For each accepted frame, the collector saves:
+`ravp` is the project env.
 
-- ego RGB image,
-- full LiDAR point cloud,
-- full CARLA instance-segmentation image,
-- ego state,
-- metadata for all visible vehicle actors.
+## Start CARLA
 
-This stage is reusable. Once raw capture exists, you can rebuild masks, GT labels, predicted labels, and detector benchmarks without recollecting CARLA.
+From inside the `CARLA/` directory, start CARLA with:
 
-### Stage B: build the GT per-target dataset
-
-The GT dataset builder:
-
-1. loads raw RGB, instance segmentation, and actor metadata,
-2. enumerates visible vehicle targets in that frame,
-3. generates one SAM3 mask per target,
-4. saves one mask file per target,
-5. writes one row per target to `gt_poses.csv`.
-
-If one frame contains 3 visible valid cars, that frame produces 3 samples:
-
-- same `rgb_path`,
-- 3 different `mask_path`s,
-- 3 different poses.
-
-This mirrors inference exactly: the image can contain many cars, but the pose model only sees one target mask at a time.
-
-### Stage C: attach predicted pose labels
-
-Predicted labels are attached afterward, not during raw capture.
-
-The detector stage:
-
-1. runs a LiDAR 3D detector on the full-frame point cloud,
-2. matches detections to the already accepted GT target actors,
-3. writes the matched subset to `pred_poses.csv`,
-4. reuses the exact same RGB and mask assets as the GT dataset.
-
-This means:
-
-- `gt_poses.csv` is the full accepted target set,
-- `pred_poses.csv` is a subset that also has matched detector poses.
-
-### Stage D: benchmark detectors
-
-The benchmark stage evaluates detector candidates at the per-target sample level rather than only at raw detector-box level.
-
-That matters because the real downstream question is:
-
-“Given a crowded ego frame and one target mask, can the detector provide a useful pose label for that target?”
-
-## Repository layout
-
-```text
-RAVP/
-├── carla_data_collection/
-│   ├── __init__.py
-│   ├── benchmark_detectors.py
-│   ├── carla_utils.py
-│   ├── config.py
-│   ├── dataset_builder.py
-│   ├── detector_3d.py
-│   ├── ground_truth.py
-│   ├── preprocess_data.py
-│   ├── raw_capture.py
-│   ├── run_collection.py
-│   └── vision_detector.py
-├── inference/
-├── mmdet3d_models/
-│   ├── centerpoint_0075voxel_second_secfpn_dcn_circlenms_4x8_cyclic_20e_nus_20220810_025930-657f67e0.pth
-│   └── configs/
-├── pose_estimation/
-└── utils/
+```bash
+mkdir -p /tmp/runtime-1001 && chown 1001:1001 /tmp/runtime-1001 && \
+HOME=/tmp XDG_RUNTIME_DIR=/tmp/runtime-1001 SDL_AUDIODRIVER=dummy DISPLAY= \
+setpriv --reuid=1001 --regid=1001 --clear-groups \
+./CarlaUE4.sh -opengl -RenderOffScreen -quality-level=Epic -carla-port=2150 -carla-streaming-port=2151 -nosound
 ```
 
-## What each collection module does
+The watchdog script uses this exact launch command and does not modify CARLA itself.
 
-- `config.py`: shared configuration for raw capture, SAM3 mask generation, detector attachment, and benchmarking.
-- `run_collection.py`: CLI entry point with separate subcommands for capture, GT build, prediction attachment, and benchmarking.
-- `raw_capture.py`: stage A raw traffic capture in CARLA.
-- `dataset_builder.py`: stage B GT build plus stage C prediction attachment.
-- `vision_detector.py`: SAM3 wrapper.
-- `detector_3d.py`: MMDetection3D wrapper currently configured around CenterPoint.
-- `ground_truth.py`: relative-pose math and detection-to-actor matching helpers.
-- `carla_utils.py`: CARLA world setup, traffic spawning, sensor synchronization, visibility filtering, and metadata creation.
-- `preprocess_data.py`: merge multiple already-built per-target datasets into one dataset root.
-- `benchmark_detectors.py`: evaluate detector candidates on accepted GT target samples.
+## Dataset layout
 
-## Environment split
-
-CARLA, SAM3, and MMDetection3D do not share a single easy dependency stack on this machine, so the practical setup is split by stage.
-
-### `ravp-carla37`
-
-Use this env for raw CARLA capture only.
-
-Reason:
-
-- local CARLA 0.9.15 provides Python 3.7 wheels here.
-
-### `ravp`
-
-Use this env for:
-
-- SAM3-backed GT dataset build,
-- future mask-conditioned training work,
-- general project-side Python tooling.
-
-### `ravp-det`
-
-Use this env for:
-
-- `attach-predictions`,
-- `benchmark-detectors`,
-- MMDetection3D-based detector experiments.
-
-## Collection outputs
-
-The built dataset layout is:
+The compact dataset format is:
 
 ```text
-carla_dataset/
-├── raw_capture/
-│   ├── rgb/
-│   ├── lidar/
-│   ├── instance/
-│   └── metadata/
+dataset/
 ├── rgb/
 ├── masks/
 ├── gt_poses.csv
 ├── pred_poses.csv
-└── benchmarks/
+├── frames.jsonl
+└── collection_summary.json
 ```
 
-### Raw capture assets
+Storage policy:
 
-`capture-raw` writes:
+- RGB is stored once per accepted frame as `768x768` JPEG
+- one binary mask PNG is stored per accepted target car
+- `gt_poses.csv` and `pred_poses.csv` reuse the same RGB and mask assets
+- full instance frames are not saved
+- raw LiDAR caches are not saved
 
-- `raw_capture/rgb/frame_XXXXXX.png`
-- `raw_capture/lidar/frame_XXXXXX.npy`
-- `raw_capture/instance/frame_XXXXXX.npy`
-- `raw_capture/metadata/frame_XXXXXX.json`
+## Sample semantics
 
-Each metadata JSON stores:
+The dataset is per-target, not per-frame.
 
-- `frame_id`, `episode_id`, `town`, `tick`
-- relative raw asset paths
-- ego pose and velocity
-- camera metadata
-- a `visible_actors` list containing one record per visible target vehicle
-- capture behavior is controlled by `--traffic-mode`:
-  - `traffic_manager` is the default for natural CARLA traffic
-  - `constant_velocity` is a fallback for maps where Traffic Manager is unstable
+If one ego frame contains 3 accepted cars, that frame produces 3 datapoints:
 
-### Final shared assets
+- same `rgb_path`
+- 3 different `mask_path`s
+- 3 different pose labels
 
-The built dataset reuses frame assets and expands them into per-target samples:
+This mirrors inference exactly: the model only predicts the pose of the car whose mask is provided.
 
-- `rgb/frame_XXXXXX.png`: shared once per frame
-- `masks/frame_XXXXXX_actor_<id>.png`: one mask per accepted target car
+## CSV schema
 
-### Per-target CSV schema
+Both `gt_poses.csv` and `pred_poses.csv` use the same columns:
 
-Both `gt_poses.csv` and `pred_poses.csv` use the same schema:
+- `sample_id`
+- `frame_id`
+- `episode_id`
+- `town`
+- `tick`
+- `actor_id`
+- `rgb_path`
+- `mask_path`
+- `bbox_x1`
+- `bbox_y1`
+- `bbox_x2`
+- `bbox_y2`
+- `mask_area_px`
+- `dx_m`
+- `dy_m`
+- `dz_m`
+- `yaw_deg`
+- `yaw_follow_deg`
+- `follow_valid`
+- `pose_score`
 
-| Column | Meaning |
-| --- | --- |
-| `sample_id` | Per-target sample id, currently `frameid_actorid` |
-| `frame_id` | Shared RGB frame id |
-| `episode_id` | Raw capture episode id |
-| `town` | CARLA town name |
-| `tick` | CARLA simulator tick |
-| `actor_id` | CARLA GT vehicle id used as the identity anchor |
-| `rgb_path` | Shared RGB frame path |
-| `mask_path` | Target mask path |
-| `bbox_x1`, `bbox_y1`, `bbox_x2`, `bbox_y2` | Target mask bbox |
-| `mask_area_px` | Target mask area in pixels |
-| `dx_m`, `dy_m`, `dz_m`, `yaw_deg` | Relative pose in ego LiDAR coordinates |
-| `pose_score` | `1.0` for GT rows, detector confidence for predicted rows |
+Meaning:
 
-Important policy:
+- `yaw_deg` is the raw relative yaw
+- `yaw_follow_deg` is the follow-regime folded yaw in `[-90, 90]`
+- `follow_valid` marks samples that fit the pursuit-style forward-follow assumption
+- `pose_score` is `1.0` for GT rows and detector confidence for predicted rows
 
-- there are no prediction-error columns anymore,
-- a frame may appear in many rows,
-- `gt_poses.csv` may have more rows than `pred_poses.csv`,
-- `pred_poses.csv` only contains targets that were accepted in GT and also matched by the detector.
+## Collection command
 
-## CLI workflow
-
-Run commands from the repository root.
-
-### 1. Capture raw traffic frames
-
-```bash
-conda activate ravp-carla37
-cd /path/to/RAVP
-python -m carla_data_collection.run_collection capture-raw \
-  --output-dir ./carla_dataset \
-  --carla-port 2150 \
-  --towns Town01 Town02 Town03 \
-  --target-samples-per-town 3000 \
-  --max-frames-per-town 12000 \
-  --max-episodes-per-town 4 \
-  --num-traffic-vehicles 80 \
-  --fresh
-```
-
-If a town crashes when Traffic Manager is initialized, rerun that town with:
-
-```bash
-python -m carla_data_collection.run_collection capture-raw \
-  --output-dir ./carla_dataset \
-  --towns Town03_Opt \
-  --traffic-mode constant_velocity \
-  --num-traffic-vehicles 40
-```
-
-### 2. Build shared RGB/masks plus GT labels
+Single-pass collection:
 
 ```bash
 conda activate ravp
-cd /path/to/RAVP
-python -m carla_data_collection.run_collection build-gt-dataset \
-  --output-dir ./carla_dataset \
-  --sam3-repo-path /path/to/sam3 \
-  --sam3-device cuda:0
+python -m carla_data_collection.run_collection collect-dataset \
+  --output-dir /my_workspace/Resume/RAVP_Dataset_Compact \
+  --carla-host localhost \
+  --carla-port 2150 \
+  --towns Town01 Town01_Opt Town02 Town02_Opt Town03 Town03_Opt Town04 Town04_Opt Town05 Town05_Opt \
+  --follow-only \
+  --min-follow-actors-per-frame 1 \
+  --max-follow-actors-per-frame 4 \
+  --follow-lateral-limit-m 12 \
+  --follow-yaw-limit-deg 120 \
+  --image-width 768 \
+  --image-height 768 \
+  --rgb-jpeg-quality 95
 ```
 
-### 3. Attach predicted detector labels
+`Town10HD` and `Town10HD_Opt` are the default holdout family for generalization.
+
+## Resume and retry
+
+The collector resumes from `frames.jsonl` and reconciles:
+
+- `gt_poses.csv`
+- `pred_poses.csv`
+- `rgb/`
+- `masks/`
+
+so interrupted runs can continue cleanly.
+
+Retry scripts:
+
+- `scripts/start_carla_watchdog.sh`
+- `scripts/start_collect_train_towns.sh`
+
+The collection launcher retries after collector failure or CARLA restart and skips the held-out `Town10HD` family.
+
+## Reporting
+
+Write a detailed detector-vs-GT report for an existing compact dataset:
 
 ```bash
-conda activate ravp-det
-cd /path/to/RAVP
-python -m carla_data_collection.run_collection attach-predictions \
-  --output-dir ./carla_dataset \
-  --detector-name centerpoint \
-  --detector-device cuda:0
+conda activate ravp
+python -m carla_data_collection.run_collection report-metrics \
+  --output-dir /my_workspace/Resume/RAVP_Dataset_Compact
 ```
 
-### 4. Benchmark detector candidates
+This writes `detailed_metrics.json` in the dataset root.
 
-```bash
-conda activate ravp-det
-cd /path/to/RAVP
-python -m carla_data_collection.run_collection benchmark-detectors \
-  --output-dir ./carla_dataset \
-  --candidate voxelnext=/path/to/config.py::/path/to/checkpoint.pth
+## Perception in collection
+
+Collection behavior per accepted frame:
+
+1. capture synchronized RGB, instance segmentation, and LiDAR in memory
+2. enumerate visible target cars
+3. run SAM3 immediately on the RGB frame with per-actor box prompts
+4. use in-memory CARLA instance masks only to assign SAM3 masks to GT actor identities
+5. run the 3D detector once on the full LiDAR frame
+6. match detections back to the accepted GT actors
+7. write GT and predicted rows immediately
+
+Nothing is deferred to a later raw replay stage.
+
+## Pursuit evaluation
+
+`pursuit_eval/` runs SAM3 and the detector in-process in `ravp`.
+
+The pursuit loop:
+
+- instantiates SAM3 and the detector once
+- tracks the target online with SAM3
+- reseeds with a bbox when needed
+- estimates target pose directly from the current LiDAR frame
+- feeds that pose into the pursuit controller
+
+## Key modules
+
+```text
+carla_data_collection/
+├── carla_utils.py
+├── collector.py
+├── config.py
+├── detector_3d.py
+├── ground_truth.py
+├── preprocess_data.py
+├── report_metrics.py
+├── run_collection.py
+├── utils.py
+└── vision_detector.py
+
+pursuit_eval/
+├── batch_run.py
+├── config.py
+├── controller.py
+├── geometry.py
+├── metrics.py
+├── perception.py
+├── run.py
+└── scenario.py
 ```
 
-## Merging multiple built datasets
+Module roles:
 
-`carla_data_collection.preprocess_data` now merges multiple already-built per-target datasets.
+- `collector.py`: the single-pass compact dataset collector
+- `vision_detector.py`: SAM3 image wrapper used during collection
+- `detector_3d.py`: MMDetection3D wrapper used during collection
+- `report_metrics.py`: detector-vs-GT dataset reporting
+- `perception.py`: in-process SAM3 tracker and detector pose source for pursuit eval
+- `run.py`: closed-loop pursuit evaluation entry point
 
-Example:
+## Practical note on size
 
-```bash
-python -m carla_data_collection.preprocess_data \
-  --source /path/to/built_datasets \
-  --dest /path/to/carla_dataset_merged
-```
+The compact layout was introduced specifically to keep training data size under control.
 
-The merged dataset preserves:
+The main size wins are:
 
-- shared `rgb/` assets,
-- shared `masks/` assets,
-- `gt_poses.csv`,
-- `pred_poses.csv`.
+- `768x768` JPEG instead of `1024x1024` PNG for RGB
+- no saved raw instance images
+- no saved raw LiDAR caches
+- no duplicate intermediate assets
 
-## Defaults and model assets
-
-The repository now contains:
-
-- vendored CenterPoint config files under `mmdet3d_models/configs/`,
-- the default CenterPoint checkpoint under `mmdet3d_models/`.
-
-Collection defaults live in `carla_data_collection/config.py`.
-
-Important configurable areas include:
-
-- CARLA host, port, and town list
-- traffic density and episode limits
-- image size and FOV
-- capture-time visibility thresholds
-- SAM3 paths and thresholds
-- detector config/checkpoint/device
-- distance, lateral, and yaw coverage bins
-
-## Training and inference notes
-
-The collection pipeline is already aligned with the intended mask-conditioned formulation.
-
-The training and inference folders are still partly legacy:
-
-- `pose_estimation/` still assumes bbox-oriented inputs in several places,
-- `inference/` still mixes learned pose with CARLA-only signals for identity tracking and target speed.
-
-So the new dataset is ahead of the current training stack. That is intentional: the collector is now producing the right data for the next training migration.
-
-## Practical limitations
-
-Important caveats:
-
-1. CARLA raw capture depends on the local CARLA wheel ABI and is easiest to keep isolated.
-2. SAM3 prompting is still an active part of the project and may need further tuning depending on scene scale and target visibility.
-3. Predicted labels are only as good as the detector match quality on the accepted GT target set.
-4. `pred_poses.csv` is expected to be smaller than `gt_poses.csv`.
-5. Some CARLA maps can be unstable with Traffic Manager; `constant_velocity` capture is the fallback when that happens.
-6. The online pursuit path is not yet fully perception-only because it still relies on simulator cues for some tracking logic.
-
-## Recommended workflow
-
-For current work, the cleanest path is:
-
-1. collect raw traffic with `capture-raw`
-2. build GT RGB/mask samples with `build-gt-dataset`
-3. attach detector labels with `attach-predictions`
-4. benchmark detectors if needed
-5. train or migrate the mask-conditioned pose model
-6. plug the trained model into pursuit
+This keeps the saved dataset aligned with the actual downstream training contract instead of archiving full raw CARLA sensor dumps.

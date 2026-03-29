@@ -1,4 +1,4 @@
-"""Configuration for the fresh pursuit evaluation pipeline."""
+"""Configuration for the simplified in-process pursuit evaluation pipeline."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 @dataclass
 class PursuitEvalConfig:
-    """Configuration shared by the CARLA runtime and perception worker."""
+    """Configuration shared by the CARLA runtime and in-process perception stack."""
 
     pose_source: str = "gt"  # one of: gt, detector
     output_dir: str = os.path.join(_REPO_ROOT, "pursuit_eval_output")
@@ -101,12 +101,7 @@ class PursuitEvalConfig:
     ego_offroad_breach_frames: int = 15
     max_pose_hold_frames: int = 12
 
-    # Detector / worker
-    sam3_worker_env: str = "ravp"
-    detector_worker_env: str = "ravp-det"
-    worker_start_timeout_s: float = 180.0
-    worker_step_timeout_s: float = 120.0
-    worker_poll_interval_s: float = 0.05
+    # In-process detector / tracker
     bootstrap_with_gt_bbox: bool = True
     enable_bbox_reseed: bool = True
     prompt_bbox_pad_px: int = 24
@@ -114,12 +109,12 @@ class PursuitEvalConfig:
     sam3_checkpoint_path: str = ""
     sam3_confidence_threshold: float = 0.35
     sam3_duplicate_iou_thr: float = 0.75
-    sam3_device: str = "cuda:1"
+    sam3_device: str = "cuda:0"
     detector_name: str = "centerpoint"
     detector_config: str = ""
     detector_checkpoint: str = ""
     detector_score_thr: float = 0.10
-    detector_device: str = "cuda:2"
+    detector_device: str = "cuda:0"
     detector_projection_iou_thr: float = 0.02
     detector_projection_score_weight: float = 0.15
 
@@ -135,8 +130,7 @@ class PursuitEvalConfig:
     spectator_yaw_deg: float = 0.0
     spectator_roll_deg: float = 0.0
     save_debug_images: bool = False
-    save_worker_masks: bool = True
-    keep_worker_frame_assets: bool = False
+    save_tracking_masks: bool = False
 
     def __post_init__(self) -> None:
         if not self.detector_config:
@@ -145,13 +139,15 @@ class PursuitEvalConfig:
                 "mmdet3d_models",
                 "configs",
                 "centerpoint",
-                "centerpoint_voxel0075_second_secfpn_head-dcn-circlenms_8xb4-cyclic-20e_nus-3d.py",
+                "centerpoint_voxel0075_second_secfpn_head-dcn-"
+                "circlenms_8xb4-cyclic-20e_nus-3d.py",
             )
         if not self.detector_checkpoint:
             self.detector_checkpoint = os.path.join(
                 _REPO_ROOT,
                 "mmdet3d_models",
-                "centerpoint_0075voxel_second_secfpn_dcn_circlenms_4x8_cyclic_20e_nus_20220810_025930-657f67e0.pth",
+                "centerpoint_0075voxel_second_secfpn_dcn_circlenms_4x8_"
+                "cyclic_20e_nus_20220810_025930-657f67e0.pth",
             )
 
     @property
@@ -173,68 +169,16 @@ class PursuitEvalConfig:
         return os.path.join(self.run_output_dir, "debug")
 
     @property
+    def tracker_masks_dir(self) -> str:
+        return os.path.join(self.debug_dir, "tracker_masks")
+
+    @property
     def spectator_frames_dir(self) -> str:
         return os.path.join(self.run_output_dir, "spectator_frames")
 
     @property
     def spectator_video_path(self) -> str:
         return os.path.join(self.run_output_dir, "spectator.mp4")
-
-    @property
-    def worker_dir(self) -> str:
-        return os.path.join(self.run_output_dir, "worker")
-
-    @property
-    def worker_requests_dir(self) -> str:
-        return os.path.join(self.worker_dir, "requests")
-
-    @property
-    def worker_responses_dir(self) -> str:
-        return os.path.join(self.worker_dir, "responses")
-
-    @property
-    def worker_assets_dir(self) -> str:
-        return os.path.join(self.worker_dir, "assets")
-
-    @property
-    def worker_masks_dir(self) -> str:
-        return os.path.join(self.worker_dir, "masks")
-
-    @property
-    def sam3_worker_dir(self) -> str:
-        return os.path.join(self.worker_dir, "sam3")
-
-    @property
-    def sam3_requests_dir(self) -> str:
-        return os.path.join(self.sam3_worker_dir, "requests")
-
-    @property
-    def sam3_responses_dir(self) -> str:
-        return os.path.join(self.sam3_worker_dir, "responses")
-
-    @property
-    def sam3_assets_dir(self) -> str:
-        return os.path.join(self.sam3_worker_dir, "assets")
-
-    @property
-    def sam3_masks_dir(self) -> str:
-        return os.path.join(self.sam3_worker_dir, "masks")
-
-    @property
-    def detector_worker_dir(self) -> str:
-        return os.path.join(self.worker_dir, "detector")
-
-    @property
-    def detector_requests_dir(self) -> str:
-        return os.path.join(self.detector_worker_dir, "requests")
-
-    @property
-    def detector_responses_dir(self) -> str:
-        return os.path.join(self.detector_worker_dir, "responses")
-
-    @property
-    def detector_assets_dir(self) -> str:
-        return os.path.join(self.detector_worker_dir, "assets")
 
     def to_dict(self) -> dict:
         return asdict(self)

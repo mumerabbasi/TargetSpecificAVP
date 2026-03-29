@@ -1,352 +1,217 @@
-"""CNN model for pose estimation from RGB images and bounding boxes."""
+"""Mask-conditioned CNN for target pose prediction."""
 
-from typing import Optional, Tuple
+from __future__ import annotations
+
+from typing import Dict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.models as models
 
 from .config import PoseEstimationConfig
+from .dataset import TranslationStats, denormalize_translation
 
 
 class PoseEstimationCNN(nn.Module):
-    """CNN model for estimating vehicle pose from RGB images.
+    """Predict target translation and pursuit yaw from RGB plus mask."""
 
-    This model uses a pretrained backbone (ResNet) and adds a pose
-    regression head. It supports different bbox input modes:
-    - crop: Image is cropped to bbox before feeding to network
-    - mask: Bbox mask is concatenated as 4th channel
-    - numeric: Bbox coordinates are concatenated to features
-    - both: Combines mask and numeric modes
-
-    Attributes:
-        config: Configuration object.
-        backbone: Feature extraction backbone.
-        pose_head: Regression head for pose prediction.
-    """
-
-    def __init__(self, config: PoseEstimationConfig):
-        """Initialize the model.
-
-        Args:
-            config: Configuration object.
-        """
+    def __init__(self, config: PoseEstimationConfig) -> None:
         super().__init__()
         self.config = config
 
-        # Determine input channels based on bbox_mode
-        if config.bbox_mode in ["mask", "both"]:
-            in_channels = 4  # RGB + mask
-        else:
-            in_channels = 3  # RGB only
-
-        # Create backbone
-        self.backbone, feature_dim = self._create_backbone(
-            config.backbone,
-            config.pretrained,
-            in_channels
+        backbone, feature_dim = _build_resnet_backbone(
+            backbone_name=config.backbone,
+            pretrained=config.pretrained,
         )
+        self.stem = backbone["stem"]
+        self.layer1 = backbone["layer1"]
+        self.layer2 = backbone["layer2"]
+        self.layer3 = backbone["layer3"]
+        self.layer4 = backbone["layer4"]
 
-        # Optionally freeze backbone
-        if config.freeze_backbone:
-            self._freeze_backbone()
-
-        # Determine additional input features
-        extra_features = 0
-        if config.bbox_mode in ["numeric", "both"]:
-            extra_features = 4  # bbox coordinates
-
-        # Create pose regression head
-        self.pose_head = self._create_pose_head(
-            feature_dim + extra_features,
-            config.num_outputs
+        self.geometry_encoder = nn.Sequential(
+            nn.Linear(5, 64),
+            nn.SiLU(inplace=True),
+            nn.Linear(64, 64),
+            nn.SiLU(inplace=True),
         )
-
-    def _create_backbone(
-        self,
-        backbone_name: str,
-        pretrained: bool,
-        in_channels: int
-    ) -> Tuple[nn.Module, int]:
-        """Create the feature extraction backbone.
-
-        Args:
-            backbone_name: Name of the backbone architecture.
-            pretrained: Whether to use pretrained weights.
-            in_channels: Number of input channels.
-
-        Returns:
-            Tuple of (backbone module, feature dimension).
-        """
-        weights = "IMAGENET1K_V1" if pretrained else None
-
-        if backbone_name == "resnet18":
-            backbone = models.resnet18(weights=weights)
-            feature_dim = 512
-        elif backbone_name == "resnet34":
-            backbone = models.resnet34(weights=weights)
-            feature_dim = 512
-        elif backbone_name == "resnet50":
-            backbone = models.resnet50(weights=weights)
-            feature_dim = 2048
-        elif backbone_name == "resnet101":
-            backbone = models.resnet101(weights=weights)
-            feature_dim = 2048
-        else:
-            raise ValueError(f"Unknown backbone: {backbone_name}")
-
-        # Modify first conv layer if input channels != 3
-        if in_channels != 3:
-            original_conv = backbone.conv1
-            backbone.conv1 = nn.Conv2d(
-                in_channels,
-                original_conv.out_channels,
-                kernel_size=original_conv.kernel_size,
-                stride=original_conv.stride,
-                padding=original_conv.padding,
-                bias=original_conv.bias is not None
-            )
-
-            # Copy weights for RGB channels
-            with torch.no_grad():
-                backbone.conv1.weight[:, :3] = original_conv.weight
-                # Initialize mask channel weights
-                if in_channels > 3:
-                    nn.init.kaiming_normal_(
-                        backbone.conv1.weight[:, 3:],
-                        mode="fan_out",
-                        nonlinearity="relu"
-                    )
-
-        # Remove the final classification layer
-        backbone = nn.Sequential(*list(backbone.children())[:-1])
-
-        return backbone, feature_dim
-
-    def _create_pose_head(
-        self,
-        in_features: int,
-        num_outputs: int
-    ) -> nn.Module:
-        """Create the pose regression head.
-
-        Args:
-            in_features: Number of input features.
-            num_outputs: Number of output dimensions.
-
-        Returns:
-            Pose regression head module.
-        """
-        return nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(in_features, 512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.3),
+        self.fusion_head = nn.Sequential(
+            nn.Linear(feature_dim * 2 + 64, 512),
+            nn.SiLU(inplace=True),
+            nn.Dropout(config.dropout),
             nn.Linear(512, 256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.2),
-            nn.Linear(256, num_outputs),
+            nn.SiLU(inplace=True),
         )
-
-    def _freeze_backbone(self) -> None:
-        """Freeze backbone parameters."""
-        for param in self.backbone.parameters():
-            param.requires_grad = False
+        self.translation_head = nn.Linear(256, 2)
+        self.yaw_head = nn.Linear(256, 2)
 
     def forward(
         self,
-        image: torch.Tensor,
-        bbox_normalized: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """Forward pass.
+        inputs: torch.Tensor,
+        masks: torch.Tensor,
+        geometry: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        features = self.stem(inputs)
+        features = self.layer1(features)
+        features = self.layer2(features)
+        features = self.layer3(features)
+        features = self.layer4(features)
 
-        Args:
-            image: Input image tensor [B, C, H, W].
-                   C=3 for crop/numeric mode, C=4 for mask/both mode.
-            bbox_normalized: Normalized bbox coordinates [B, 4] for
-                           numeric/both mode. Optional.
+        global_features = F.adaptive_avg_pool2d(
+            features, output_size=1).flatten(1)
+        target_features = _masked_average_pool(
+            features, masks, global_features)
+        geometry_features = self.geometry_encoder(geometry)
 
-        Returns:
-            Predicted pose tensor [B, num_outputs].
-        """
-        # Extract features from backbone
-        features = self.backbone(image)
-        features = features.view(features.size(0), -1)
+        fused = torch.cat(
+            [global_features, target_features, geometry_features], dim=1)
+        fused = self.fusion_head(fused)
 
-        # Concatenate bbox coordinates if using numeric mode
-        if self.config.bbox_mode in ["numeric", "both"]:
-            if bbox_normalized is not None:
-                features = torch.cat([features, bbox_normalized], dim=1)
-
-        # Predict pose
-        pose = self.pose_head(features)
-
-        return pose
-
-
-class PoseEstimationLoss(nn.Module):
-    """Loss function for pose estimation.
-
-    Computes weighted MSE loss for each pose component.
-
-    Attributes:
-        config: Configuration object.
-        mse: MSE loss function.
-    """
-
-    def __init__(self, config: PoseEstimationConfig):
-        """Initialize the loss function.
-
-        Args:
-            config: Configuration object.
-        """
-        super().__init__()
-        self.config = config
-        self.mse = nn.MSELoss(reduction="none")
-
-        # Build loss weights based on which outputs are enabled
-        weights = []
-        if config.predict_dx:
-            weights.append(config.loss_weight_dx)
-        if config.predict_dy:
-            weights.append(config.loss_weight_dy)
-        if config.predict_dz:
-            weights.append(config.loss_weight_dz)
-        if config.predict_yaw:
-            weights.append(config.loss_weight_yaw)
-
-        self.register_buffer(
-            "weights",
-            torch.tensor(weights, dtype=torch.float32)
-        )
-
-    def forward(
-        self,
-        predictions: torch.Tensor,
-        targets: torch.Tensor
-    ) -> Tuple[torch.Tensor, dict]:
-        """Compute the loss.
-
-        Args:
-            predictions: Predicted pose tensor [B, num_outputs].
-            targets: Target pose tensor [B, num_outputs].
-
-        Returns:
-            Tuple of (total_loss, loss_dict with individual losses).
-        """
-        # Compute MSE for each dimension
-        mse_per_dim = self.mse(predictions, targets).mean(dim=0)
-
-        # Apply weights
-        weighted_losses = mse_per_dim * self.weights
-
-        # Total loss
-        total_loss = weighted_losses.sum()
-
-        # Build loss dict for logging
-        loss_dict = {"total": total_loss.item()}
-        output_names = self.config.output_names
-
-        for i, name in enumerate(output_names):
-            loss_dict[f"mse_{name}"] = mse_per_dim[i].item()
-            loss_dict[f"weighted_{name}"] = weighted_losses[i].item()
-
-        return total_loss, loss_dict
-
-
-class PoseEstimationMetrics:
-    """Metrics for pose estimation evaluation.
-
-    Computes MAE and RMSE for each pose component in original units.
-    """
-
-    def __init__(self, config: PoseEstimationConfig):
-        """Initialize metrics.
-
-        Args:
-            config: Configuration object.
-        """
-        self.config = config
-        self.reset()
-
-    def reset(self) -> None:
-        """Reset accumulated metrics."""
-        self.predictions = []
-        self.targets = []
-
-    def update(
-        self,
-        predictions: torch.Tensor,
-        targets: torch.Tensor
-    ) -> None:
-        """Add predictions and targets to accumulator.
-
-        Args:
-            predictions: Predicted pose tensor [B, num_outputs].
-            targets: Target pose tensor [B, num_outputs].
-        """
-        self.predictions.append(predictions.detach().cpu())
-        self.targets.append(targets.detach().cpu())
-
-    def compute(self) -> dict:
-        """Compute final metrics.
-
-        Returns:
-            Dictionary with MAE and RMSE for each component.
-        """
-        if not self.predictions:
-            return {}
-
-        predictions = torch.cat(self.predictions, dim=0)
-        targets = torch.cat(self.targets, dim=0)
-
-        # Compute errors
-        errors = predictions - targets
-        abs_errors = torch.abs(errors)
-        squared_errors = errors ** 2
-
-        metrics = {}
-        output_names = self.config.output_names
-        units = self._get_units()
-
-        for i, name in enumerate(output_names):
-            mae = abs_errors[:, i].mean().item()
-            rmse = torch.sqrt(squared_errors[:, i].mean()).item()
-            unit = units[name]
-
-            metrics[f"mae_{name}"] = mae
-            metrics[f"rmse_{name}"] = rmse
-            metrics[f"mae_{name}_{unit}"] = mae
-            metrics[f"rmse_{name}_{unit}"] = rmse
-
-        # Overall metrics
-        metrics["mae_total"] = abs_errors.mean().item()
-        metrics["rmse_total"] = torch.sqrt(squared_errors.mean()).item()
-
-        return metrics
-
-    def _get_units(self) -> dict:
-        """Get units for each output dimension.
-
-        Returns:
-            Dictionary mapping output names to units.
-        """
+        translation = self.translation_head(fused)
+        yaw_vector = F.normalize(self.yaw_head(fused), dim=1)
         return {
-            "dx": "m",
-            "dy": "m",
-            "dz": "m",
-            "yaw": "deg",
+            "translation": translation,
+            "yaw_vector": yaw_vector,
         }
 
 
-def create_model(config: PoseEstimationConfig) -> PoseEstimationCNN:
-    """Create a pose estimation model.
+class PoseEstimationLoss(nn.Module):
+    """Joint translation and pursuit-yaw loss."""
 
-    Args:
-        config: Configuration object.
+    def __init__(self, config: PoseEstimationConfig) -> None:
+        super().__init__()
+        self.dx_loss_weight = config.dx_loss_weight
+        self.dy_loss_weight = config.dy_loss_weight
+        self.yaw_loss_weight = config.yaw_loss_weight
 
-    Returns:
-        Initialized model.
-    """
-    model = PoseEstimationCNN(config)
-    return model
+    def forward(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        translation_target: torch.Tensor,
+        yaw_target: torch.Tensor,
+    ) -> tuple[torch.Tensor, Dict[str, float]]:
+        translation_loss = F.smooth_l1_loss(
+            outputs["translation"],
+            translation_target,
+            reduction="none",
+        )
+        dx_loss = translation_loss[:, 0].mean()
+        dy_loss = translation_loss[:, 1].mean()
+        yaw_alignment = F.cosine_similarity(
+            outputs["yaw_vector"], yaw_target, dim=1)
+        yaw_loss = (1.0 - yaw_alignment).mean()
+
+        total_loss = (
+            self.dx_loss_weight * dx_loss
+            + self.dy_loss_weight * dy_loss
+            + self.yaw_loss_weight * yaw_loss
+        )
+        return total_loss, {
+            "loss_total": float(total_loss.detach().item()),
+            "loss_dx": float(dx_loss.detach().item()),
+            "loss_dy": float(dy_loss.detach().item()),
+            "loss_yaw": float(yaw_loss.detach().item()),
+        }
+
+
+def decode_predictions(
+    outputs: Dict[str, torch.Tensor],
+    translation_stats: TranslationStats,
+) -> Dict[str, torch.Tensor]:
+    translation = denormalize_translation(
+        outputs["translation"], translation_stats)
+    yaw_rad = torch.atan2(outputs["yaw_vector"]
+                          [:, 0], outputs["yaw_vector"][:, 1])
+    yaw_deg = torch.rad2deg(yaw_rad)
+    return {
+        "translation": translation,
+        "yaw_follow_deg": yaw_deg,
+    }
+
+
+def compute_pose_metrics(
+    predicted_translation: torch.Tensor,
+    predicted_yaw_deg: torch.Tensor,
+    target_translation: torch.Tensor,
+    target_yaw_deg: torch.Tensor,
+) -> Dict[str, float]:
+    translation_error = (predicted_translation - target_translation).abs()
+    yaw_error = wrap_angle_deg(predicted_yaw_deg - target_yaw_deg).abs()
+    yaw_axis_error = torch.minimum(yaw_error, (180.0 - yaw_error).abs())
+    return {
+        "mae_dx_m": float(translation_error[:, 0].mean().item()),
+        "mae_dy_m": float(translation_error[:, 1].mean().item()),
+        "mae_yaw_follow_deg": float(yaw_error.mean().item()),
+        "mae_yaw_axis_deg": float(yaw_axis_error.mean().item()),
+    }
+
+
+def wrap_angle_deg(angle_deg: torch.Tensor) -> torch.Tensor:
+    return torch.remainder(angle_deg + 180.0, 360.0) - 180.0
+
+
+def _build_resnet_backbone(
+    backbone_name: str,
+    pretrained: bool,
+) -> tuple[Dict[str, nn.Module], int]:
+    weights_lookup = {
+        "resnet18": models.ResNet18_Weights.IMAGENET1K_V1,
+        "resnet34": models.ResNet34_Weights.IMAGENET1K_V1,
+        "resnet50": models.ResNet50_Weights.IMAGENET1K_V2,
+    }
+    if backbone_name not in weights_lookup:
+        raise ValueError(f"Unsupported backbone: {backbone_name}")
+
+    builder = getattr(models, backbone_name)
+    weights = weights_lookup[backbone_name] if pretrained else None
+    resnet = builder(weights=weights)
+
+    original_conv = resnet.conv1
+    resnet.conv1 = nn.Conv2d(
+        4,
+        original_conv.out_channels,
+        kernel_size=original_conv.kernel_size,
+        stride=original_conv.stride,
+        padding=original_conv.padding,
+        bias=False,
+    )
+    with torch.no_grad():
+        resnet.conv1.weight[:, :3] = original_conv.weight
+        resnet.conv1.weight[:, 3:4] = original_conv.weight.mean(
+            dim=1, keepdim=True)
+
+    feature_dim = resnet.fc.in_features
+    return ({"stem": nn.Sequential(resnet.conv1,
+                                   resnet.bn1,
+                                   resnet.relu,
+                                   resnet.maxpool),
+             "layer1": resnet.layer1,
+             "layer2": resnet.layer2,
+             "layer3": resnet.layer3,
+             "layer4": resnet.layer4,
+             },
+            feature_dim,
+            )
+
+
+def _masked_average_pool(
+    features: torch.Tensor,
+    masks: torch.Tensor,
+    global_features: torch.Tensor,
+) -> torch.Tensor:
+    resized_masks = F.interpolate(
+        masks,
+        size=features.shape[-2:],
+        mode="nearest",
+    )
+    weighted_sum = (features * resized_masks).sum(dim=(2, 3))
+    mask_sum = resized_masks.sum(dim=(2, 3)).clamp_min(1.0)
+    masked_features = weighted_sum / mask_sum
+
+    empty_mask = resized_masks.sum(dim=(2, 3)).squeeze(1) <= 0
+    if empty_mask.any():
+        masked_features = masked_features.clone()
+        masked_features[empty_mask] = global_features[empty_mask].to(
+            masked_features.dtype)
+    return masked_features

@@ -1,692 +1,523 @@
-"""Training script for pose estimation CNN."""
+"""Training entry point for the mask-conditioned target pose CNN."""
+
+from __future__ import annotations
 
 import argparse
 import json
-import os
-import time
-from datetime import datetime
-from typing import Optional, Tuple
+import random
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Dict, Optional
 
-import pandas as pd
+import numpy as np
 import torch
-import torch.backends.cudnn as cudnn
 import wandb
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import (
-    CosineAnnealingLR,
-    ReduceLROnPlateau,
-    StepLR,
-)
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from .config import PoseEstimationConfig
 from .dataset import (
     PoseEstimationDataset,
-    compute_pose_statistics,
-    create_data_splits,
+    TranslationStats,
+    build_frame_splits,
+    load_pose_rows,
+    split_summary,
 )
 from .model import (
     PoseEstimationCNN,
     PoseEstimationLoss,
-    PoseEstimationMetrics,
-    create_model,
+    compute_pose_metrics,
+    decode_predictions,
 )
-
-# Optimize CUDA performance
-cudnn.benchmark = True  # Auto-tune convolution algorithms
-cudnn.deterministic = False  # Allow non-deterministic for speed
-
-
-class Trainer:
-    """Trainer class for pose estimation model.
-
-    Handles training loop, validation, logging, and checkpointing.
-
-    Attributes:
-        config: Configuration object.
-        model: Pose estimation model.
-        criterion: Loss function.
-        optimizer: Optimizer.
-        scheduler: Learning rate scheduler.
-        device: Device to train on.
-    """
-
-    def __init__(
-        self,
-        config: PoseEstimationConfig,
-        model: PoseEstimationCNN,
-        train_loader: DataLoader,
-        val_loader: DataLoader,
-        test_loader: Optional[DataLoader] = None,
-        use_wandb: bool = True,
-    ):
-        """Initialize the trainer.
-
-        Args:
-            config: Configuration object.
-            model: Pose estimation model.
-            train_loader: Training data loader.
-            val_loader: Validation data loader.
-            test_loader: Optional test data loader.
-            use_wandb: Whether to use Weights & Biases logging.
-        """
-        self.config = config
-        self.use_wandb = use_wandb
-        self.device = torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
-        print(f"Using device: {self.device}")
-
-        # Move model to device
-        self.model = model.to(self.device)
-
-        # Data loaders
-        self.train_loader = train_loader
-        self.val_loader = val_loader
-        self.test_loader = test_loader
-
-        # Loss and metrics
-        self.criterion = PoseEstimationLoss(config).to(self.device)
-        self.metrics = PoseEstimationMetrics(config)
-
-        # Optimizer
-        self.optimizer = AdamW(
-            self.model.parameters(),
-            lr=config.learning_rate,
-            weight_decay=config.weight_decay,
-        )
-
-        # Scheduler
-        self.scheduler = self._create_scheduler()
-
-        # Tracking
-        self.best_val_loss = float("inf")
-        self.epochs_without_improvement = 0
-        self.global_step = 0
-        self.history = {
-            "train_loss": [],
-            "val_loss": [],
-            "val_metrics": [],
-            "learning_rate": [],
-        }
-
-        # Create experiment directory
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.exp_dir = os.path.join(
-            config.output_dir,
-            f"{config.experiment_name}_{timestamp}"
-        )
-        os.makedirs(self.exp_dir, exist_ok=True)
-
-        # Save config
-        self._save_config()
-
-        # Initialize wandb
-        self._init_wandb()
-
-    def _init_wandb(self) -> None:
-        """Initialize Weights & Biases logging."""
-        if not self.use_wandb:
-            return
-
-        # Build config dict for wandb
-        config_dict = {
-            k: v for k, v in self.config.__dict__.items()
-            if not k.startswith("_")
-        }
-        for k, v in config_dict.items():
-            if isinstance(v, tuple):
-                config_dict[k] = list(v)
-
-        # Add additional info
-        config_dict["device"] = str(self.device)
-        config_dict["num_train_samples"] = len(self.train_loader.dataset)
-        config_dict["num_val_samples"] = len(self.val_loader.dataset)
-        if self.test_loader is not None:
-            config_dict["num_test_samples"] = len(self.test_loader.dataset)
-        config_dict["num_parameters"] = sum(
-            p.numel() for p in self.model.parameters() if p.requires_grad
-        )
-
-        # Initialize wandb run
-        wandb.init(
-            project="pose-estimation",
-            name=f"{self.config.experiment_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-            config=config_dict,
-            dir=self.exp_dir,
-            tags=[
-                self.config.backbone,
-                self.config.bbox_mode,
-                "gt" if self.config.use_gt_poses else "pred",
-            ],
-        )
-
-        # Watch model for gradient logging
-        wandb.watch(self.model, log="all", log_freq=100)
-
-    def _create_scheduler(self):
-        """Create learning rate scheduler based on config."""
-        if self.config.lr_scheduler == "step":
-            return StepLR(
-                self.optimizer,
-                step_size=self.config.lr_step_size,
-                gamma=self.config.lr_gamma,
-            )
-        elif self.config.lr_scheduler == "cosine":
-            return CosineAnnealingLR(
-                self.optimizer,
-                T_max=self.config.num_epochs,
-            )
-        elif self.config.lr_scheduler == "plateau":
-            return ReduceLROnPlateau(
-                self.optimizer,
-                mode="min",
-                factor=self.config.lr_gamma,
-                patience=5,
-            )
-        else:
-            raise ValueError(
-                f"Unknown scheduler: {self.config.lr_scheduler}"
-            )
-
-    def _save_config(self) -> None:
-        """Save configuration to experiment directory."""
-        config_path = os.path.join(self.exp_dir, "config.json")
-        config_dict = {
-            k: v for k, v in self.config.__dict__.items()
-            if not k.startswith("_")
-        }
-        # Convert tuples to lists for JSON serialization
-        for k, v in config_dict.items():
-            if isinstance(v, tuple):
-                config_dict[k] = list(v)
-
-        with open(config_path, "w") as f:
-            json.dump(config_dict, f, indent=2)
-
-    def train_epoch(self) -> float:
-        """Train for one epoch.
-
-        Returns:
-            Average training loss.
-        """
-        self.model.train()
-        total_loss = 0.0
-        num_batches = len(self.train_loader)
-
-        pbar = tqdm(self.train_loader, desc="Training")
-        for batch_idx, batch in enumerate(pbar):
-            # Move data to device
-            image = batch["image"].to(self.device)
-            pose = batch["pose"].to(self.device)
-
-            # Get bbox if needed
-            bbox_normalized = None
-            if self.config.bbox_mode in ["numeric", "both"]:
-                bbox_normalized = batch["bbox_normalized"].to(self.device)
-
-            # Forward pass
-            self.optimizer.zero_grad()
-            predictions = self.model(image, bbox_normalized)
-
-            # Compute loss
-            loss, loss_dict = self.criterion(predictions, pose)
-
-            # Backward pass
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
-
-            total_loss += loss.item()
-            self.global_step += 1
-
-            # Update progress bar
-            if batch_idx % self.config.log_interval == 0:
-                pbar.set_postfix({"loss": f"{loss.item():.4f}"})
-
-                # Log batch metrics to wandb
-                if self.use_wandb:
-                    wandb.log({
-                        "train/batch_loss": loss.item(),
-                        "train/batch_mse_dx": loss_dict.get("mse_dx", 0),
-                        "train/batch_mse_dy": loss_dict.get("mse_dy", 0),
-                        "train/batch_mse_dz": loss_dict.get("mse_dz", 0),
-                        "train/batch_mse_yaw": loss_dict.get("mse_yaw", 0),
-                        "global_step": self.global_step,
-                    })
-
-        avg_loss = total_loss / num_batches
-        return avg_loss
-
-    @torch.no_grad()
-    def validate(self, loader: DataLoader) -> Tuple[float, dict]:
-        """Validate the model.
-
-        Args:
-            loader: Data loader for validation.
-
-        Returns:
-            Tuple of (average loss, metrics dictionary).
-        """
-        self.model.eval()
-        self.metrics.reset()
-
-        total_loss = 0.0
-        num_batches = len(loader)
-
-        for batch in tqdm(loader, desc="Validating"):
-            # Move data to device
-            image = batch["image"].to(self.device)
-            pose = batch["pose"].to(self.device)
-            pose_raw = batch["pose_raw"].to(self.device)
-
-            # Get bbox if needed
-            bbox_normalized = None
-            if self.config.bbox_mode in ["numeric", "both"]:
-                bbox_normalized = batch["bbox_normalized"].to(self.device)
-
-            # Forward pass
-            predictions = self.model(image, bbox_normalized)
-
-            # Compute loss
-            loss, _ = self.criterion(predictions, pose)
-            total_loss += loss.item()
-
-            # Denormalize predictions for metrics
-            pred_raw = self.train_loader.dataset.denormalize_pose(predictions)
-            self.metrics.update(pred_raw, pose_raw)
-
-        avg_loss = total_loss / num_batches
-        metrics = self.metrics.compute()
-
-        return avg_loss, metrics
-
-    def train(self) -> None:
-        """Run the full training loop."""
-        print(f"\nStarting training for {self.config.num_epochs} epochs...")
-        print(f"Experiment directory: {self.exp_dir}")
-
-        for epoch in range(self.config.num_epochs):
-            print(f"\n{'='*60}")
-            print(f"Epoch {epoch + 1}/{self.config.num_epochs}")
-            print(f"{'='*60}")
-
-            # Train
-            start_time = time.time()
-            train_loss = self.train_epoch()
-            train_time = time.time() - start_time
-
-            # Validate
-            val_loss, val_metrics = self.validate(self.val_loader)
-
-            # Update scheduler
-            current_lr = self.optimizer.param_groups[0]["lr"]
-            if self.config.lr_scheduler == "plateau":
-                self.scheduler.step(val_loss)
-            else:
-                self.scheduler.step()
-
-            # Record history
-            self.history["train_loss"].append(train_loss)
-            self.history["val_loss"].append(val_loss)
-            self.history["val_metrics"].append(val_metrics)
-            self.history["learning_rate"].append(current_lr)
-
-            # Print summary
-            print(f"\nTrain Loss: {train_loss:.4f}")
-            print(f"Val Loss:   {val_loss:.4f}")
-            print(f"LR:         {current_lr:.6f}")
-            print(f"Time:       {train_time:.1f}s")
-
-            print("\nValidation Metrics:")
-            for name in self.config.output_names:
-                mae = val_metrics.get(f"mae_{name}", 0)
-                rmse = val_metrics.get(f"rmse_{name}", 0)
-                unit = "deg" if name == "yaw" else "m"
-                print(f"  {name}: MAE={mae:.4f}{unit}, RMSE={rmse:.4f}{unit}")
-
-            # Log epoch metrics to wandb
-            if self.use_wandb:
-                wandb_log = {
-                    "epoch": epoch + 1,
-                    "train/loss": train_loss,
-                    "val/loss": val_loss,
-                    "learning_rate": current_lr,
-                    "epoch_time_seconds": train_time,
-                }
-                # Add per-component metrics
-                for name in self.config.output_names:
-                    mae = val_metrics.get(f"mae_{name}", 0)
-                    rmse = val_metrics.get(f"rmse_{name}", 0)
-                    wandb_log[f"val/mae_{name}"] = mae
-                    wandb_log[f"val/rmse_{name}"] = rmse
-                # Add overall metrics
-                wandb_log["val/mae_total"] = val_metrics.get("mae_total", 0)
-                wandb_log["val/rmse_total"] = val_metrics.get("rmse_total", 0)
-                wandb_log["best_val_loss"] = self.best_val_loss
-                wandb.log(wandb_log)
-
-            # Check for improvement
-            if val_loss < self.best_val_loss:
-                self.best_val_loss = val_loss
-                self.epochs_without_improvement = 0
-                self._save_checkpoint(epoch, is_best=True)
-                print("\n*** New best model saved! ***")
-            else:
-                self.epochs_without_improvement += 1
-                if not self.config.save_best_only:
-                    self._save_checkpoint(epoch, is_best=False)
-
-            # Early stopping
-            if (self.epochs_without_improvement >=
-                    self.config.early_stopping_patience):
-                print(f"\nEarly stopping after {epoch + 1} epochs.")
-                break
-
-        # Save training history
-        self._save_history()
-
-        # Final evaluation on test set
-        if self.test_loader is not None:
-            print("\n" + "=" * 60)
-            print("Final Evaluation on Test Set")
-            print("=" * 60)
-            self._load_best_model()
-            test_loss, test_metrics = self.validate(self.test_loader)
-            print(f"\nTest Loss: {test_loss:.4f}")
-            print("\nTest Metrics:")
-            for name in self.config.output_names:
-                mae = test_metrics.get(f"mae_{name}", 0)
-                rmse = test_metrics.get(f"rmse_{name}", 0)
-                unit = "deg" if name == "yaw" else "m"
-                print(f"  {name}: MAE={mae:.4f}{unit}, RMSE={rmse:.4f}{unit}")
-
-            # Save test results
-            test_results = {
-                "test_loss": test_loss,
-                "test_metrics": test_metrics
-            }
-            results_path = os.path.join(self.exp_dir, "test_results.json")
-            with open(results_path, "w") as f:
-                json.dump(test_results, f, indent=2)
-
-            # Log test results to wandb
-            if self.use_wandb:
-                wandb_log = {"test/loss": test_loss}
-                for name in self.config.output_names:
-                    mae = test_metrics.get(f"mae_{name}", 0)
-                    rmse = test_metrics.get(f"rmse_{name}", 0)
-                    wandb_log[f"test/mae_{name}"] = mae
-                    wandb_log[f"test/rmse_{name}"] = rmse
-                wandb_log["test/mae_total"] = test_metrics.get("mae_total", 0)
-                wandb_log["test/rmse_total"] = test_metrics.get("rmse_total", 0)
-                wandb.log(wandb_log)
-
-        # Finish wandb run
-        if self.use_wandb:
-            wandb.finish()
-
-    def _save_checkpoint(self, epoch: int, is_best: bool) -> None:
-        """Save model checkpoint.
-
-        Args:
-            epoch: Current epoch.
-            is_best: Whether this is the best model so far.
-        """
-        checkpoint = {
-            "epoch": epoch,
-            "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "scheduler_state_dict": self.scheduler.state_dict(),
-            "best_val_loss": self.best_val_loss,
-            "history": self.history,
-        }
-
-        if is_best:
-            path = os.path.join(self.exp_dir, "best_model.pth")
-        else:
-            path = os.path.join(
-                self.exp_dir, f"checkpoint_epoch_{epoch+1}.pth"
-            )
-
-        torch.save(checkpoint, path)
-
-        # Log model artifact to wandb
-        '''if self.use_wandb and is_best:
-            artifact = wandb.Artifact(
-                name=f"model-{self.config.experiment_name}",
-                type="model",
-                description=f"Best model checkpoint at epoch {epoch + 1}",
-                metadata={
-                    "epoch": epoch,
-                    "val_loss": self.best_val_loss,
-                    "backbone": self.config.backbone,
-                    "bbox_mode": self.config.bbox_mode,
-                }
-            )
-            artifact.add_file(path)
-            wandb.log_artifact(artifact)'''
-
-    def _load_best_model(self) -> None:
-        """Load the best model checkpoint."""
-        path = os.path.join(self.exp_dir, "best_model.pth")
-        checkpoint = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
-
-    def _save_history(self) -> None:
-        """Save training history to JSON."""
-        path = os.path.join(self.exp_dir, "history.json")
-        with open(path, "w") as f:
-            json.dump(self.history, f, indent=2)
-
-
-def main(args: argparse.Namespace) -> None:
-    """Main training function.
-
-    Args:
-        args: Command line arguments.
-    """
-    # Create config - args override defaults
-    config = PoseEstimationConfig(
-        # Paths (from args)
-        csv_path=args.csv_path,
-        images_dir=args.images_dir,
-        output_dir=args.output_dir,
-        # Model settings (from args)
-        backbone=args.backbone,
-        bbox_mode=args.bbox_mode,
-        # Training settings (from args)
-        batch_size=args.batch_size,
-        num_epochs=args.num_epochs,
-        learning_rate=args.learning_rate,
-        # Pose source (from args)
-        use_gt_poses=args.use_gt,
-        # Experiment name (from args)
-        experiment_name=args.experiment_name,
-    )
-
-    print("Configuration:")
-    print(f"  CSV path:     {config.csv_path}")
-    print(f"  Images dir:   {config.images_dir}")
-    print(f"  Output dir:   {config.output_dir}")
-    print(f"  Backbone:     {config.backbone}")
-    print(f"  Bbox mode:    {config.bbox_mode}")
-    print(f"  Use GT poses: {config.use_gt_poses}")
-    print(f"  Batch size:   {config.batch_size}")
-    print(f"  Epochs:       {config.num_epochs}")
-    print(f"  LR:           {config.learning_rate}")
-    print(f"  Outputs:      {config.output_names}")
-
-    # Load data
-    print("\nLoading data...")
-    df = pd.read_csv(config.csv_path)
-    print(f"Loaded {len(df)} samples")
-
-    # Compute pose statistics
-    pose_mean, pose_std = compute_pose_statistics(
-        df, use_gt=config.use_gt_poses
-    )
-    config.pose_mean = pose_mean
-    config.pose_std = pose_std
-    print("\nPose statistics:")
-    print(f"  Mean: {pose_mean}")
-    print(f"  Std:  {pose_std}")
-
-    # Create data splits
-    train_df, val_df, test_df = create_data_splits(df, config)
-
-    # Create datasets
-    train_dataset = PoseEstimationDataset(
-        config, train_df, is_training=True
-    )
-    val_dataset = PoseEstimationDataset(
-        config, val_df, is_training=False
-    )
-    test_dataset = PoseEstimationDataset(
-        config, test_df, is_training=False
-    )
-
-    # Create data loaders with optimized settings for faster I/O
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=config.num_workers,
-        pin_memory=True,
-        prefetch_factor=2,
-        persistent_workers=True if config.num_workers > 0 else False,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=config.num_workers,
-        pin_memory=True,
-        prefetch_factor=2,
-        persistent_workers=True if config.num_workers > 0 else False,
-    )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=config.num_workers,
-        pin_memory=True,
-        prefetch_factor=2,
-        persistent_workers=True if config.num_workers > 0 else False,
-    )
-
-    # Create model
-    print("\nCreating model...")
-    model = create_model(config)
-    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model parameters: {num_params:,}")
-
-    # Initialize wandb with API key
-    if args.wandb:
-        os.environ["WANDB_API_KEY"] = "7c5329ecdd14418cc7e621e369822111fc474e08"
-        print("\nWandB logging enabled")
-
-    # Create trainer and train
-    trainer = Trainer(
-        config,
-        model,
-        train_loader,
-        val_loader,
-        test_loader,
-        use_wandb=args.wandb,
-    )
-    trainer.train()
-
-    print("\nTraining complete!")
-    print(f"Results saved to: {trainer.exp_dir}")
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Train pose estimation CNN model"
+        description="Train the mask-conditioned target pose CNN",
     )
-
-    parser.add_argument(
-        "--csv-path",
-        type=str,
-        default=(
-            "/storage/remote/atcremers45/s0050/carla_dataset/poses_filtered.csv"
-        ),
-        help="Path to CSV file with pose annotations",
-    )
-    parser.add_argument(
-        "--images-dir",
-        type=str,
-        default="/storage/remote/atcremers45/s0050/carla_dataset/rgb",
-        help="Directory containing RGB images",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default=(
-            "/usr/prakt/s0050/ravp/pose_estimation_runs"
-        ),
-        help="Output directory for experiments",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=32,
-        help="Batch size for training",
-    )
-    parser.add_argument(
-        "--num-epochs",
-        type=int,
-        default=50,
-        help="Number of training epochs",
-    )
-    parser.add_argument(
-        "--learning-rate",
-        type=float,
-        default=1e-4,
-        help="Learning rate",
-    )
+    parser.add_argument("--dataset-root", required=True)
+    parser.add_argument("--label-source", choices=["gt", "pred"], default="gt")
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--experiment-name", default="mask_conditioned_pose")
+    parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument(
         "--backbone",
-        type=str,
+        choices=["resnet18", "resnet34", "resnet50"],
         default="resnet50",
-        choices=["resnet18", "resnet34", "resnet50", "resnet101"],
-        help="Backbone architecture",
     )
-    parser.add_argument(
-        "--bbox-mode",
-        type=str,
-        default="mask",
-        choices=["crop", "mask", "numeric", "both"],
-        help="How to incorporate bounding box information",
-    )
-    parser.add_argument(
-        "--use-gt",
-        action="store_true",
-        default=False,
-        help="Use ground truth poses (default: False)",
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--num-epochs", type=int, default=40)
+    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--min-learning-rate", type=float, default=1e-6)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--train-ratio", type=float, default=0.8)
+    parser.add_argument("--val-ratio", type=float, default=0.1)
+    parser.add_argument("--test-ratio", type=float, default=0.1)
+    parser.add_argument("--min-mask-area-px", type=int, default=0)
+    parser.add_argument("--max-train-samples", type=int, default=0)
+    parser.add_argument("--max-val-samples", type=int, default=0)
+    parser.add_argument("--max-test-samples", type=int, default=0)
+    parser.add_argument("--max-train-batches", type=int, default=0)
+    parser.add_argument("--max-val-batches", type=int, default=0)
+    parser.add_argument("--max-test-batches", type=int, default=0)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--no-amp", action="store_true")
+    parser.add_argument("--no-pretrained", action="store_true")
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--grad-clip-norm", type=float, default=1.0)
+    parser.add_argument("--log-every-steps", type=int, default=25)
+    parser.add_argument("--dx-loss-weight", type=float, default=1.0)
+    parser.add_argument("--dy-loss-weight", type=float, default=1.0)
+    parser.add_argument("--yaw-loss-weight", type=float, default=1.0)
+    parser.add_argument("--wandb-project", default="ravp-pose")
+    parser.add_argument("--wandb-run-name", default="")
+    parser.add_argument("--no-wandb", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    config = PoseEstimationConfig(
+        dataset_root=args.dataset_root,
+        label_source=args.label_source,
+        output_dir=args.output_dir,
+        experiment_name=args.experiment_name,
+        image_size=(args.image_size, args.image_size),
+        backbone=args.backbone,
+        pretrained=not args.no_pretrained,
+        dropout=args.dropout,
+        batch_size=args.batch_size,
+        num_epochs=args.num_epochs,
+        learning_rate=args.learning_rate,
+        min_learning_rate=args.min_learning_rate,
+        weight_decay=args.weight_decay,
+        num_workers=args.num_workers,
+        device=args.device,
+        use_amp=not args.no_amp,
+        grad_clip_norm=args.grad_clip_norm,
+        log_every_steps=args.log_every_steps,
+        train_ratio=args.train_ratio,
+        val_ratio=args.val_ratio,
+        test_ratio=args.test_ratio,
+        random_seed=args.seed,
+        min_mask_area_px=args.min_mask_area_px,
+        max_train_samples=args.max_train_samples,
+        max_val_samples=args.max_val_samples,
+        max_test_samples=args.max_test_samples,
+        max_train_batches=args.max_train_batches,
+        max_val_batches=args.max_val_batches,
+        max_test_batches=args.max_test_batches,
+        dx_loss_weight=args.dx_loss_weight,
+        dy_loss_weight=args.dy_loss_weight,
+        yaw_loss_weight=args.yaw_loss_weight,
+        wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run_name,
+        wandb_enabled=not args.no_wandb,
     )
 
-    parser.add_argument(
-        "--experiment-name",
-        type=str,
-        default="pose_estimation",
-        help="Name for this experiment",
+    set_random_seed(config.random_seed)
+    torch.set_float32_matmul_precision("high")
+
+    rows = load_pose_rows(config)
+    rows_by_split = build_frame_splits(rows, config)
+    translation_stats = TranslationStats.from_rows(rows_by_split["train"])
+
+    run_dir = create_run_dir(config)
+    save_json(run_dir / "config.json", config.to_dict())
+    save_json(run_dir / "translation_stats.json", translation_stats.to_dict())
+    save_json(run_dir / "split_summary.json", split_summary(rows_by_split))
+
+    train_dataset = PoseEstimationDataset(
+        config,
+        rows_by_split["train"],
+        translation_stats,
+        training=True,
     )
-    parser.add_argument(
-        "--wandb",
-        action="store_true",
-        default=False,
-        help="Enable Weights & Biases logging (default: False)",
+    val_dataset = PoseEstimationDataset(
+        config,
+        rows_by_split["val"],
+        translation_stats,
+        training=False,
+    )
+    test_dataset = PoseEstimationDataset(
+        config,
+        rows_by_split["test"],
+        translation_stats,
+        training=False,
     )
 
-    args = parser.parse_args()
+    train_loader = make_loader(
+        train_dataset,
+        config.batch_size,
+        config.num_workers,
+        training=True,
+    )
+    val_loader = make_loader(
+        val_dataset,
+        config.batch_size,
+        config.num_workers,
+        training=False,
+    )
+    test_loader = make_loader(
+        test_dataset,
+        config.batch_size,
+        config.num_workers,
+        training=False,
+    )
 
-    return args
+    device = select_device(config.device)
+    model = PoseEstimationCNN(config).to(device)
+    if config.channels_last:
+        model = model.to(memory_format=torch.channels_last)
+    criterion = PoseEstimationLoss(config)
+    optimizer = AdamW(
+        model.parameters(),
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+    )
+    scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=config.num_epochs,
+        eta_min=config.min_learning_rate,
+    )
+    scaler = torch.cuda.amp.GradScaler(
+        enabled=(config.use_amp and device.type == "cuda"),
+    )
+
+    wandb_run = init_wandb(
+        config,
+        run_dir,
+        train_dataset,
+        val_dataset,
+        test_dataset,
+        model,
+    )
+
+    best_val_loss = float("inf")
+    history = []
+    for epoch in range(1, config.num_epochs + 1):
+        train_stats = run_epoch(
+            model=model,
+            loader=train_loader,
+            criterion=criterion,
+            optimizer=optimizer,
+            scaler=scaler,
+            device=device,
+            translation_stats=translation_stats,
+            training=True,
+            use_amp=config.use_amp,
+            max_batches=config.max_train_batches,
+            channels_last=config.channels_last,
+            grad_clip_norm=config.grad_clip_norm,
+            progress_label=f"train {epoch}/{config.num_epochs}",
+            log_every_steps=config.log_every_steps,
+            wandb_run=wandb_run,
+            global_step_base=(epoch - 1) * max(len(train_loader), 1),
+        )
+        val_stats = run_epoch(
+            model=model,
+            loader=val_loader,
+            criterion=criterion,
+            optimizer=None,
+            scaler=None,
+            device=device,
+            translation_stats=translation_stats,
+            training=False,
+            use_amp=config.use_amp,
+            max_batches=config.max_val_batches,
+            channels_last=config.channels_last,
+            grad_clip_norm=0.0,
+            progress_label=f"val {epoch}/{config.num_epochs}",
+            log_every_steps=config.log_every_steps,
+            wandb_run=None,
+            global_step_base=0,
+        )
+
+        scheduler.step()
+
+        epoch_record = {
+            "epoch": epoch,
+            "train": train_stats,
+            "val": val_stats,
+            "learning_rate": float(optimizer.param_groups[0]["lr"]),
+        }
+        history.append(epoch_record)
+        save_json(run_dir / "history.json", history)
+
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    "epoch": epoch,
+                    "lr": epoch_record["learning_rate"],
+                    **prefix_metrics("train", train_stats),
+                    **prefix_metrics("val", val_stats),
+                }
+            )
+
+        checkpoint = {
+            "epoch": epoch, "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict(),
+            "scaler_state": scaler.state_dict()
+            if scaler is not None else None, "config": config.to_dict(),
+            "translation_stats": translation_stats.to_dict(),
+            "train_stats": train_stats, "val_stats": val_stats, }
+        torch.save(checkpoint, run_dir / "last.pt")
+        if val_stats["loss_total"] < best_val_loss:
+            best_val_loss = val_stats["loss_total"]
+            torch.save(checkpoint, run_dir / "best.pt")
+
+        print(
+            f"[epoch {epoch:03d}] "
+            f"train_loss={train_stats['loss_total']:.4f} "
+            f"val_loss={val_stats['loss_total']:.4f} "
+            f"val_dx={val_stats['mae_dx_m']:.3f} "
+            f"val_dy={val_stats['mae_dy_m']:.3f} "
+            f"val_yaw_follow={val_stats['mae_yaw_follow_deg']:.3f}"
+        )
+
+    best_checkpoint = torch.load(
+        run_dir / "best.pt",
+        map_location=device,
+        weights_only=False,
+    )
+    model.load_state_dict(best_checkpoint["model_state"])
+    test_stats = run_epoch(
+        model=model,
+        loader=test_loader,
+        criterion=criterion,
+        optimizer=None,
+        scaler=None,
+        device=device,
+        translation_stats=translation_stats,
+        training=False,
+        use_amp=config.use_amp,
+        max_batches=config.max_test_batches,
+        channels_last=config.channels_last,
+        grad_clip_norm=0.0,
+        progress_label="test",
+        log_every_steps=config.log_every_steps,
+        wandb_run=None,
+        global_step_base=0,
+    )
+    save_json(run_dir / "test_metrics.json", test_stats)
+
+    if wandb_run is not None:
+        wandb_run.log(prefix_metrics("test", test_stats))
+        wandb_run.finish()
+
+    print("\nTraining complete")
+    print(f"Run directory: {run_dir}")
+    print(json.dumps(test_stats, indent=2))
+
+
+def run_epoch(
+    model: PoseEstimationCNN,
+    loader: DataLoader,
+    criterion: PoseEstimationLoss,
+    optimizer: Optional[AdamW],
+    scaler: Optional[torch.amp.GradScaler],
+    device: torch.device,
+    translation_stats: TranslationStats,
+    training: bool,
+    use_amp: bool,
+    max_batches: int,
+    channels_last: bool,
+    grad_clip_norm: float,
+    progress_label: str,
+    log_every_steps: int,
+    wandb_run: Optional[wandb.sdk.wandb_run.Run],
+    global_step_base: int,
+) -> Dict[str, float]:
+    if training:
+        model.train()
+    else:
+        model.eval()
+
+    total_loss = 0.0
+    total_dx = 0.0
+    total_dy = 0.0
+    total_yaw = 0.0
+    num_batches = 0
+
+    pred_translations = []
+    pred_yaws = []
+    gt_translations = []
+    gt_yaws = []
+
+    iterator = tqdm(loader, desc=progress_label, leave=False)
+    for batch_index, batch in enumerate(iterator):
+        if max_batches > 0 and batch_index >= max_batches:
+            break
+
+        inputs = batch["input"].to(device, non_blocking=True)
+        masks = batch["mask"].to(device, non_blocking=True)
+        geometry = batch["geometry"].to(device, non_blocking=True)
+        translation_target = batch["translation_target"].to(
+            device, non_blocking=True)
+        translation_raw = batch["translation_raw"].to(
+            device, non_blocking=True)
+        yaw_target = batch["yaw_target"].to(device, non_blocking=True)
+        yaw_follow_deg = batch["yaw_follow_deg"].to(device, non_blocking=True)
+
+        if channels_last:
+            inputs = inputs.contiguous(memory_format=torch.channels_last)
+
+        if training:
+            assert optimizer is not None
+            optimizer.zero_grad(set_to_none=True)
+
+        with torch.autocast(
+            device_type=device.type,
+            enabled=(use_amp and device.type == "cuda"),
+        ):
+            outputs = model(inputs, masks, geometry)
+            loss, loss_dict = criterion(
+                outputs, translation_target, yaw_target)
+
+        if training:
+            assert scaler is not None
+            scaler.scale(loss).backward()
+            if grad_clip_norm > 0.0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), grad_clip_norm)
+            scaler.step(optimizer)
+            scaler.update()
+
+        decoded = decode_predictions(outputs, translation_stats)
+        pred_translations.append(decoded["translation"].detach().cpu())
+        pred_yaws.append(decoded["yaw_follow_deg"].detach().cpu())
+        gt_translations.append(translation_raw.detach().cpu())
+        gt_yaws.append(yaw_follow_deg.detach().cpu())
+
+        total_loss += loss_dict["loss_total"]
+        total_dx += loss_dict["loss_dx"]
+        total_dy += loss_dict["loss_dy"]
+        total_yaw += loss_dict["loss_yaw"]
+        num_batches += 1
+
+        if (
+            training
+            and wandb_run is not None
+            and (batch_index + 1) % max(log_every_steps, 1) == 0
+        ):
+            wandb_run.log(
+                {
+                    "step": global_step_base + batch_index + 1,
+                    "train_step/loss_total": loss_dict["loss_total"],
+                    "train_step/loss_dx": loss_dict["loss_dx"],
+                    "train_step/loss_dy": loss_dict["loss_dy"],
+                    "train_step/loss_yaw": loss_dict["loss_yaw"],
+                }
+            )
+
+    if num_batches == 0:
+        raise ValueError(f"{progress_label} produced zero batches")
+
+    predicted_translation = torch.cat(pred_translations, dim=0)
+    predicted_yaw = torch.cat(pred_yaws, dim=0)
+    target_translation = torch.cat(gt_translations, dim=0)
+    target_yaw = torch.cat(gt_yaws, dim=0)
+    metrics = compute_pose_metrics(
+        predicted_translation,
+        predicted_yaw,
+        target_translation,
+        target_yaw,
+    )
+    metrics.update(
+        {
+            "loss_total": total_loss / num_batches,
+            "loss_dx": total_dx / num_batches,
+            "loss_dy": total_dy / num_batches,
+            "loss_yaw": total_yaw / num_batches,
+        }
+    )
+    return metrics
+
+
+def make_loader(
+    dataset: PoseEstimationDataset,
+    batch_size: int,
+    num_workers: int,
+    training: bool,
+) -> DataLoader:
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=training,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=num_workers > 0,
+        drop_last=training,
+    )
+
+
+def select_device(device_name: str) -> torch.device:
+    if device_name.startswith("cuda") and not torch.cuda.is_available():
+        return torch.device("cpu")
+    return torch.device(device_name)
+
+
+def set_random_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def create_run_dir(config: PoseEstimationConfig) -> Path:
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    run_dir = Path(config.output_dir) / f"{config.experiment_name}_{timestamp}"
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
+
+
+def save_json(path: Path, payload: object) -> None:
+    with path.open("w") as handle:
+        json.dump(payload, handle, indent=2)
+
+
+def init_wandb(
+    config: PoseEstimationConfig,
+    run_dir: Path,
+    train_dataset: PoseEstimationDataset,
+    val_dataset: PoseEstimationDataset,
+    test_dataset: PoseEstimationDataset,
+    model: PoseEstimationCNN,
+) -> Optional[wandb.sdk.wandb_run.Run]:
+    if not config.wandb_enabled:
+        return None
+
+    run_name = config.wandb_run_name or run_dir.name
+    payload = config.to_dict()
+    payload.update(
+        {
+            "num_train_rows": len(train_dataset),
+            "num_val_rows": len(val_dataset),
+            "num_test_rows": len(test_dataset),
+            "num_parameters": sum(
+                p.numel() for p in model.parameters() if p.requires_grad
+            ),
+        }
+    )
+    return wandb.init(
+        project=config.wandb_project,
+        name=run_name,
+        config=payload,
+        dir=str(run_dir),
+        save_code=False,
+        settings=wandb.Settings(start_method="thread"),
+    )
+
+
+def prefix_metrics(prefix: str, metrics: Dict[str, float]) -> Dict[str, float]:
+    return {f"{prefix}/{key}": value for key, value in metrics.items()}
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    main(args)
+    main()

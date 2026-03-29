@@ -42,7 +42,10 @@ def main():
         [*args.input_dir.glob("*.jpg"), *args.input_dir.glob("*.png")]
     )
     if not img_paths:
-        print(f"No .jpg or .png images found in {args.input_dir}", file=sys.stderr)
+        print(
+            f"No .jpg or .png images found in {
+                args.input_dir}",
+            file=sys.stderr)
         sys.exit(1)
 
     # Read first image to get size
@@ -68,7 +71,9 @@ def main():
     for img_path in img_paths:
         frame = cv2.imread(str(img_path))
         if frame is None:
-            print(f"Warning: skipping unreadable image {img_path}", file=sys.stderr)
+            print(
+                f"Warning: skipping unreadable image {img_path}",
+                file=sys.stderr)
             continue
         # Ensure same size
         if (frame.shape[1], frame.shape[0]) != size:

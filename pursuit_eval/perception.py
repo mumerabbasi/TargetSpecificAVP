@@ -1,20 +1,25 @@
-"""Persistent SAM3 online tracker worker with bbox reseed recovery."""
+"""In-process SAM3 tracking and 3D detector pose extraction for pursuit eval."""
 
 from __future__ import annotations
 
-import argparse
-import json
 import os
 import sys
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 import torch
 
 from .config import PursuitEvalConfig
-from .geometry import bbox_from_mask, bbox_iou
+from .geometry import (
+    bbox_from_mask,
+    bbox_iou,
+    get_camera_intrinsic,
+    mask_iou,
+    project_detection_box_to_image,
+    wrap_angle_rad,
+)
 
 
 def _ensure_dir(path: str) -> None:
@@ -28,7 +33,7 @@ def _resolve_device(device: str) -> str:
 
 
 class OnlineSam3Tracker:
-    """Simple online SAM3 tracker: bootstrap, track, reseed."""
+    """Simple online SAM3 tracker with bootstrap and bbox reseed."""
 
     def __init__(self, config: PursuitEvalConfig) -> None:
         if config.sam3_repo_path and config.sam3_repo_path not in sys.path:
@@ -43,7 +48,9 @@ class OnlineSam3Tracker:
         if self.device.startswith("cuda"):
             torch.cuda.set_device(torch.device(self.device))
 
-        model = build_tracker(apply_temporal_disambiguation=False, with_backbone=True)
+        model = build_tracker(
+            apply_temporal_disambiguation=False,
+            with_backbone=True)
         checkpoint_path = config.sam3_checkpoint_path or download_ckpt_from_hf()
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
         if "model" in checkpoint and isinstance(checkpoint["model"], dict):
@@ -60,14 +67,7 @@ class OnlineSam3Tracker:
                 if key.startswith("detector.backbone.")
             }
         )
-        missing_keys, unexpected_keys = model.load_state_dict(tracker_state, strict=False)
-        if missing_keys or unexpected_keys:
-            print(
-                "sam3 tracker load diagnostics: missing_keys={}, unexpected_keys={}".format(
-                    len(missing_keys),
-                    len(unexpected_keys),
-                )
-            )
+        model.load_state_dict(tracker_state, strict=False)
 
         self.model = model.to(self.device).eval()
         self.transforms = SAM2Transforms(
@@ -92,11 +92,12 @@ class OnlineSam3Tracker:
             offload_state_to_cpu=True,
         )
 
-    def _cache_frame_features(self, frame_idx: int, rgb_image: np.ndarray) -> None:
+    def _cache_frame_features(
+            self,
+            frame_idx: int,
+            rgb_image: np.ndarray) -> None:
         input_image = self.transforms(rgb_image)[None, ...].to(self.device)
         backbone_out = self.model.forward_image(input_image)
-        # The online tracker only needs the current frame's backbone features.
-        # Keeping every frame here quickly blows up GPU memory.
         self.inference_state["cached_features"] = {
             int(frame_idx): (input_image, backbone_out),
         }
@@ -104,35 +105,39 @@ class OnlineSam3Tracker:
     def _restart_stream(self, start_frame_idx: int) -> None:
         if self.propagation_iterator is not None:
             self.propagation_iterator.close()
-        max_frame_num_to_track = max(int(self.config.num_frames) - int(start_frame_idx), 0)
         self.propagation_iterator = self.model.propagate_in_video(
-            self.inference_state,
-            start_frame_idx=int(start_frame_idx),
-            max_frame_num_to_track=max_frame_num_to_track,
-            reverse=False,
-            tqdm_disable=True,
-            propagate_preflight=True,
-        )
+            self.inference_state, start_frame_idx=int(start_frame_idx),
+            max_frame_num_to_track=max(
+                int(self.config.num_frames) - int(start_frame_idx),
+                0),
+            reverse=False, tqdm_disable=True, propagate_preflight=True,)
 
     def _next_output(self, expected_frame_idx: int):
         if self.propagation_iterator is None:
             raise RuntimeError("SAM3 tracker stream is not initialized.")
-        frame_idx, obj_ids, _, video_res_masks, obj_scores = next(self.propagation_iterator)
+        frame_idx, obj_ids, _, video_res_masks, obj_scores = next(
+            self.propagation_iterator
+        )
         if int(frame_idx) != int(expected_frame_idx):
             raise RuntimeError(
-                "SAM3 tracker yielded frame {} while frame {} was requested".format(
-                    frame_idx,
-                    expected_frame_idx,
-                )
+                "SAM3 tracker yielded frame "
+                f"{frame_idx} while frame {expected_frame_idx} was requested"
             )
         self.last_output_frame_idx = int(frame_idx)
         return obj_ids, video_res_masks, obj_scores
 
     @staticmethod
-    def _largest_component(mask: np.ndarray, hint_bbox: Optional[Tuple[int, int, int, int]]) -> np.ndarray:
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    def _largest_component(
+        mask: np.ndarray,
+        hint_bbox: Optional[Tuple[int, int, int, int]],
+    ) -> np.ndarray:
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            mask.astype(np.uint8),
+            connectivity=8,
+        )
         if num_labels <= 1:
             return mask
+
         best_label = 0
         best_score = -1.0
         for label in range(1, num_labels):
@@ -146,8 +151,8 @@ class OnlineSam3Tracker:
             if hint_bbox is not None:
                 score += 5000.0 * bbox_iou(bbox, hint_bbox)
             if score > best_score:
-                best_score = score
                 best_label = label
+                best_score = score
         if best_label <= 0:
             return mask
         return labels == best_label
@@ -160,6 +165,7 @@ class OnlineSam3Tracker:
     ) -> Tuple[Optional[np.ndarray], Optional[float], Optional[float]]:
         if obj_ids is None or video_res_masks is None:
             return None, None, None
+
         obj_ids = [int(value) for value in obj_ids]
         try:
             obj_index = obj_ids.index(self.object_id)
@@ -184,9 +190,11 @@ class OnlineSam3Tracker:
                 return None, logit_max, threshold
             threshold = logit_max - 0.5
             mask = mask_logits > threshold
+
         if not np.any(mask):
             return None, logit_max, threshold
-        mask = self._largest_component(mask.astype(bool), hint_bbox).astype(bool)
+        mask = self._largest_component(
+            mask.astype(bool), hint_bbox).astype(bool)
         if not np.any(mask):
             return None, logit_max, threshold
         return mask, logit_max, threshold
@@ -201,9 +209,15 @@ class OnlineSam3Tracker:
         self._ensure_state(frame_idx)
         self._cache_frame_features(frame_idx, rgb_image)
 
-        bootstrap_used = bool(frame_idx == 0 and bootstrap_bbox_xyxy is not None)
+        bootstrap_used = bool(
+            frame_idx == 0 and bootstrap_bbox_xyxy is not None
+        )
         reseed_used = bool(reseed_bbox_xyxy is not None)
-        hint_bbox = reseed_bbox_xyxy if reseed_bbox_xyxy is not None else bootstrap_bbox_xyxy
+        hint_bbox = (
+            reseed_bbox_xyxy
+            if reseed_bbox_xyxy is not None
+            else bootstrap_bbox_xyxy
+        )
 
         start = time.time()
         if frame_idx == 0:
@@ -233,14 +247,16 @@ class OnlineSam3Tracker:
                 raise RuntimeError("SAM3 tracker was not bootstrapped.")
             if int(frame_idx) != self.last_output_frame_idx + 1:
                 raise RuntimeError(
-                    "SAM3 tracker expected frame {} but got {}".format(
-                        self.last_output_frame_idx + 1,
-                        frame_idx,
-                    )
-                )
+                    f"SAM3 tracker expected frame {
+                        self.last_output_frame_idx +
+                        1} but got {frame_idx}")
 
         obj_ids, video_res_masks, obj_scores = self._next_output(frame_idx)
-        mask, tracker_logit_max, threshold_used = self._decode_mask(obj_ids, video_res_masks, hint_bbox)
+        mask, tracker_logit_max, threshold_used = self._decode_mask(
+            obj_ids,
+            video_res_masks,
+            hint_bbox,
+        )
         latency_ms = (time.time() - start) * 1000.0
         if mask is None:
             return {
@@ -279,14 +295,19 @@ class OnlineSam3Tracker:
             except Exception:
                 score_value = None
 
-        mask_path = os.path.join(
-            self.config.sam3_masks_dir,
-            "frame_{:06d}.png".format(int(frame_idx)),
-        )
-        cv2.imwrite(mask_path, mask.astype(np.uint8) * 255)
+        mask_path = None
+        if bool(self.config.save_tracking_masks):
+            _ensure_dir(self.config.tracker_masks_dir)
+            mask_path = os.path.join(
+                self.config.tracker_masks_dir,
+                f"frame_{int(frame_idx):06d}.png",
+            )
+            cv2.imwrite(mask_path, mask.astype(np.uint8) * 255)
+
         return {
             "frame": int(frame_idx),
             "mask_available": True,
+            "mask": mask,
             "mask_bbox_xyxy": [int(v) for v in bbox],
             "mask_area_px": int(mask.sum()),
             "mask_score": score_value,
@@ -299,107 +320,176 @@ class OnlineSam3Tracker:
         }
 
 
-class Sam3Worker:
-    """Long-lived file-backed SAM3 worker."""
+def _carla_to_nuscenes_points(points_carla: np.ndarray) -> np.ndarray:
+    if points_carla.size == 0:
+        return np.zeros((0, 5), dtype=np.float32)
+    points_nus = np.zeros((points_carla.shape[0], 5), dtype=np.float32)
+    points_nus[:, 0] = points_carla[:, 0]
+    points_nus[:, 1] = -points_carla[:, 1]
+    points_nus[:, 2] = points_carla[:, 2]
+    points_nus[:, 3] = np.clip(points_carla[:, 3], 0.0, 1.0)
+    points_nus[:, 4] = 0.0
+    return points_nus
+
+
+def _nuscenes_to_carla_box(box_nus: np.ndarray) -> Dict[str, object]:
+    center = np.array(
+        [box_nus[0], -box_nus[1], box_nus[2] + (box_nus[5] * 0.5)],
+        dtype=np.float32,
+    )
+    yaw = float(wrap_angle_rad(-float(box_nus[6])))
+    return {
+        "center": center,
+        "dims": np.array([box_nus[3], box_nus[4], box_nus[5]], dtype=np.float32),
+        "yaw_rad": yaw,
+        "yaw_deg": float(np.degrees(yaw)),
+    }
+
+
+def _extract_data_sample(det_output):
+    if hasattr(det_output, "pred_instances_3d"):
+        return det_output
+    if isinstance(det_output, (list, tuple)):
+        for item in det_output:
+            try:
+                return _extract_data_sample(item)
+            except RuntimeError:
+                continue
+    raise RuntimeError("Could not find Det3DDataSample in detector output.")
+
+
+class MMDet3DPoseSource:
+    """MMDetection3D detector wrapper for full-frame LiDAR inference."""
 
     def __init__(self, config: PursuitEvalConfig) -> None:
+        from mmdet3d.apis import inference_detector, init_model
+
         self.config = config
-        self.tracker = OnlineSam3Tracker(config)
+        self.device = _resolve_device(config.detector_device)
+        if self.device.startswith("cuda"):
+            torch.cuda.set_device(torch.device(self.device))
 
-    def run(self) -> None:
-        for path in (
-            self.config.sam3_worker_dir,
-            self.config.sam3_requests_dir,
-            self.config.sam3_responses_dir,
-            self.config.sam3_assets_dir,
-            self.config.sam3_masks_dir,
-        ):
-            _ensure_dir(path)
-        ready_path = os.path.join(self.config.sam3_worker_dir, "ready.json")
-        with open(ready_path, "w") as handle:
-            json.dump({"ready": True, "pid": os.getpid()}, handle)
+        self.inference_detector = inference_detector
+        self.model = init_model(
+            config.detector_config,
+            config.detector_checkpoint,
+            device=self.device,
+        )
+        self.score_thr = float(config.detector_score_thr)
+        self.intrinsic = get_camera_intrinsic(
+            config.image_width,
+            config.image_height,
+            config.fov,
+        )
 
-        while True:
-            request_files = sorted(
-                name for name in os.listdir(self.config.sam3_requests_dir) if name.endswith(".json")
-            )
-            if not request_files:
-                time.sleep(float(self.config.worker_poll_interval_s))
+    def detect(
+            self, lidar_points_carla: np.ndarray) -> List[Dict[str, object]]:
+        if lidar_points_carla.size == 0 or lidar_points_carla.shape[0] < 10:
+            return []
+
+        pred = _extract_data_sample(
+            self.inference_detector(
+                self.model,
+                _carla_to_nuscenes_points(lidar_points_carla))).pred_instances_3d
+        bboxes_3d = pred.bboxes_3d.tensor.detach().cpu().numpy()
+        scores_3d = pred.scores_3d.detach().cpu().numpy()
+        labels_3d = pred.labels_3d.detach().cpu().numpy()
+
+        class_names = getattr(
+            self.model,
+            "dataset_meta",
+            {}).get(
+            "classes",
+            None)
+        if class_names is not None:
+            car_ids = [idx for idx, name in enumerate(
+                class_names) if name.lower() == "car"]
+            if car_ids:
+                cls_mask = np.isin(labels_3d, car_ids)
+                bboxes_3d = bboxes_3d[cls_mask]
+                scores_3d = scores_3d[cls_mask]
+
+        detections: List[Dict[str, object]] = []
+        for box_nus, score in zip(bboxes_3d, scores_3d):
+            if float(score) < self.score_thr:
                 continue
+            det = _nuscenes_to_carla_box(box_nus)
+            det["score"] = float(score)
+            detections.append(det)
+        return detections
 
-            for name in request_files:
-                request_path = os.path.join(self.config.sam3_requests_dir, name)
-                try:
-                    with open(request_path, "r") as handle:
-                        request = json.load(handle)
-                except json.JSONDecodeError:
-                    time.sleep(float(self.config.worker_poll_interval_s))
-                    continue
-                if request.get("type") == "stop":
-                    os.remove(request_path)
-                    return
-                response = self._handle_request(request)
-                response_path = os.path.join(
-                    self.config.sam3_responses_dir,
-                    "frame_{:06d}.json".format(int(request["frame"])),
-                )
-                tmp_response_path = response_path + ".tmp"
-                with open(tmp_response_path, "w") as handle:
-                    json.dump(response, handle, indent=2)
-                os.replace(tmp_response_path, response_path)
-                os.remove(request_path)
-
-    def _handle_request(self, request: Dict[str, object]) -> Dict[str, object]:
-        frame_idx = int(request["frame"])
-        rgb_path = str(request["rgb_path"])
-        bootstrap_bbox = request.get("bootstrap_bbox_xyxy")
-        reseed_bbox = request.get("reseed_bbox_xyxy")
-        reseed_reason = str(request.get("reseed_reason", ""))
+    def estimate_pose(
+        self,
+        *,
+        lidar_points: np.ndarray,
+        target_mask: np.ndarray,
+        mask_bbox_xyxy: Tuple[int, int, int, int],
+        lidar_to_camera: np.ndarray,
+    ) -> Dict[str, object]:
         try:
-            rgb_bgr = cv2.imread(rgb_path, cv2.IMREAD_COLOR)
-            if rgb_bgr is None:
-                raise FileNotFoundError("Could not read RGB frame {}".format(rgb_path))
-            rgb_image = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2RGB)
-            response = self.tracker.track(
-                frame_idx=frame_idx,
-                rgb_image=rgb_image,
-                bootstrap_bbox_xyxy=None
-                if bootstrap_bbox is None
-                else tuple(int(v) for v in bootstrap_bbox),
-                reseed_bbox_xyxy=None
-                if reseed_bbox is None
-                else tuple(int(v) for v in reseed_bbox),
+            start = time.time()
+            detections = self.detect(lidar_points)
+            latency_ms = (time.time() - start) * 1000.0
+
+            best_det = None
+            best_score = 0.0
+            for det in detections:
+                proj_bbox, proj_mask = project_detection_box_to_image(
+                    np.asarray(det["center"], dtype=np.float64),
+                    np.asarray(det["dims"], dtype=np.float64),
+                    float(det["yaw_rad"]),
+                    lidar_to_camera,
+                    self.intrinsic,
+                    self.config.image_width,
+                    self.config.image_height,
+                )
+                if proj_bbox is None or proj_mask is None:
+                    continue
+                overlap = max(
+                    mask_iou(target_mask, proj_mask),
+                    bbox_iou(mask_bbox_xyxy, proj_bbox),
+                )
+                score = overlap + float(
+                    self.config.detector_projection_score_weight
+                ) * float(det["score"])
+                if (
+                    overlap >= float(
+                        self.config.detector_projection_iou_thr
+                    )
+                    and score > best_score
+                ):
+                    best_score = score
+                    best_det = {
+                        "pose": det,
+                        "projection_bbox": proj_bbox,
+                        "projection_overlap": overlap,
+                    }
+
+            response = {
+                "pose_available": best_det is not None,
+                "latency_ms": latency_ms,
+            }
+            if best_det is None:
+                response["error"] = "no detector box matched the target mask"
+                return response
+
+            response.update(
+                {
+                    "dx_m": float(best_det["pose"]["center"][0]),
+                    "dy_m": float(best_det["pose"]["center"][1]),
+                    "dz_m": float(best_det["pose"]["center"][2]),
+                    "yaw_deg": float(best_det["pose"]["yaw_deg"]),
+                    "pose_score": float(best_det["pose"]["score"]),
+                    "projection_bbox_xyxy": [
+                        int(v) for v in best_det["projection_bbox"]
+                    ],
+                    "projection_overlap": float(best_det["projection_overlap"]),
+                }
             )
-            response["bbox_reseed_reason"] = reseed_reason
             return response
         except Exception as exc:
             return {
-                "frame": frame_idx,
-                "mask_available": False,
-                "bbox_bootstrap_used": bool(frame_idx == 0 and bootstrap_bbox is not None),
-                "bbox_reseed_used": bool(reseed_bbox is not None),
-                "bbox_reseed_reason": reseed_reason,
+                "pose_available": False,
                 "latency_ms": None,
-                "error": "{}: {}".format(type(exc).__name__, exc),
+                "error": f"{type(exc).__name__}: {exc}",
             }
-        finally:
-            if not self.config.keep_worker_frame_assets and os.path.exists(rgb_path):
-                os.remove(rgb_path)
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="SAM3 worker")
-    parser.add_argument("--config", required=True, help="Path to pursuit_eval config.json")
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-    with open(args.config, "r") as handle:
-        payload = json.load(handle)
-    config = PursuitEvalConfig(**payload)
-    Sam3Worker(config).run()
-
-
-if __name__ == "__main__":
-    main()

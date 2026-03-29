@@ -1,7 +1,7 @@
 """Main script for vehicle pursuit using pose estimation and MPC control."""
 
-import argparse
 import os
+import argparse
 import time
 from typing import Dict, Optional
 
@@ -63,7 +63,8 @@ class VehiclePursuit:
         self.world: Optional[carla.World] = None
         self.ego: Optional[carla.Vehicle] = None
         self.targets: list = []  # For autopilot targets
-        self.tracked_target: Optional[carla.Vehicle] = None  # The target we're pursuing
+        # The target we're pursuing
+        self.tracked_target: Optional[carla.Vehicle] = None
         self.instance_to_actor: dict = {}  # Maps instance_id -> carla.Vehicle
         self.sensor_manager: Optional[SensorManager] = None
         self.spectator_manager: Optional[SpectatorManager] = None
@@ -194,7 +195,11 @@ class VehiclePursuit:
             print("[Init] No vehicles found in first frame")
             return False
 
-        print(f"[Init] Found {len(all_masks)} vehicle instances: {list(all_masks.keys())}")
+        print(
+            f"[Init] Found {
+                len(all_masks)} vehicle instances: {
+                list(
+                    all_masks.keys())}")
 
         # Run pose estimation on each instance
         instance_poses: Dict[int, dict] = {}
@@ -209,11 +214,14 @@ class VehiclePursuit:
             instance_poses, self.targets, self.ego, max_match_dist=8.0
         )
 
-        print(f"[Init] Matched {len(self.instance_to_actor)} instances to actors:")
+        print(
+            f"[Init] Matched {len(self.instance_to_actor)} instances to actors:")
         for inst_id, actor in self.instance_to_actor.items():
-            role = actor.attributes.get("role_name", "unknown") if actor else "None"
+            role = actor.attributes.get(
+                "role_name", "unknown") if actor else "None"
             actor_id = actor.id if actor else "N/A"
-            print(f"[Init]   Instance {inst_id} -> Actor {actor_id} (role={role})")
+            print(
+                f"[Init]   Instance {inst_id} -> Actor {actor_id} (role={role})")
 
         # Select instance to track: prefer the one matching target_ahead
         selected_instance = None
@@ -223,7 +231,8 @@ class VehiclePursuit:
             for inst_id, actor in self.instance_to_actor.items():
                 if actor is not None and actor.id == self.tracked_target.id:
                     selected_instance = inst_id
-                    print(f"[Init] Selected instance {inst_id} (matched target_ahead)")
+                    print(
+                        f"[Init] Selected instance {inst_id} (matched target_ahead)")
                     break
 
         # Fallback: select largest vehicle closest to center
@@ -234,7 +243,8 @@ class VehiclePursuit:
             best_inst = None
             best_dist = float("inf")
 
-            vehicles = self.sensor_manager.find_vehicle_instances(instance_image, 100)
+            vehicles = self.sensor_manager.find_vehicle_instances(
+                instance_image, 100)
             for inst_id, count, bbox in vehicles:
                 if inst_id in all_masks:
                     bbox_center = (bbox[0] + bbox[2]) // 2
@@ -245,7 +255,8 @@ class VehiclePursuit:
 
             if best_inst is not None:
                 selected_instance = best_inst
-                print(f"[Init] Fallback: selected instance {selected_instance} (center)")
+                print(
+                    f"[Init] Fallback: selected instance {selected_instance} (center)")
 
         if selected_instance is not None:
             self.sensor_manager.set_tracked_instance(selected_instance)
@@ -278,16 +289,17 @@ class VehiclePursuit:
 
                 # Get sensor data
                 rgb_image, instance_image = self.sensor_manager.get_sensor_data(
-                    timeout=1.0
-                )
+                    timeout=1.0)
 
                 if rgb_image is None or instance_image is None:
                     print("[Warning] Missing sensor data, skipping frame")
                     continue
 
-                # First frame: initialize tracking with instance-to-actor mapping
+                # First frame: initialize tracking with instance-to-actor
+                # mapping
                 if not tracking_initialized:
-                    if not self._initialize_tracking(rgb_image, instance_image):
+                    if not self._initialize_tracking(
+                            rgb_image, instance_image):
                         print("[Warning] Tracking init failed, retrying...")
                         continue
                     tracking_initialized = True
@@ -312,7 +324,8 @@ class VehiclePursuit:
                 gt_pose = None
                 matched_actor = self.instance_to_actor.get(tracked_id)
                 if matched_actor is not None and matched_actor.is_alive:
-                    gt_pose = compute_ground_truth_pose(self.ego, matched_actor)
+                    gt_pose = compute_ground_truth_pose(
+                        self.ego, matched_actor)
 
                 # Store pose for statistics
                 self.pose_errors.append({
@@ -422,7 +435,11 @@ class VehiclePursuit:
             err_dx = estimated_pose['dx'] - gt_pose['dx']
             err_dy = estimated_pose['dy'] - gt_pose['dy']
             err_dyaw = estimated_pose.get('dyaw', 0.0) - gt_pose['dyaw']
-            print(f"  Err:  dx={err_dx:.2f}m, dy={err_dy:.2f}m, dyaw={err_dyaw:.1f}°")
+            print(
+                f"  Err:  dx={
+                    err_dx:.2f}m, dy={
+                    err_dy:.2f}m, dyaw={
+                    err_dyaw:.1f}°")
         print(f"  Speed: {vehicle_state.speed * 3.6:.1f} km/h")
         print(f"  Control: throttle={control_cmd.throttle:.2f}, "
               f"steer={control_cmd.steer:.2f}, "
@@ -467,32 +484,48 @@ class VehiclePursuit:
 
         # Predicted pose (green)
         pred_dyaw = estimated_pose.get('dyaw', 0.0)
-        text = f"Pred: dx={estimated_pose['dx']:.1f}m, dy={estimated_pose['dy']:.1f}m, yaw={pred_dyaw:.1f}"
+        text = f"Pred: dx={
+            estimated_pose['dx']:.1f}m, dy={
+            estimated_pose['dy']:.1f}m, yaw={
+            pred_dyaw:.1f}"
         cv2.putText(ego_frame, text, (10, y_offset), font, 0.6, (0, 255, 0), 2)
         y_offset += 25
 
         # Ground truth pose (cyan)
         if gt_pose is not None:
-            text = f"GT:   dx={gt_pose['dx']:.1f}m, dy={gt_pose['dy']:.1f}m, yaw={gt_pose['dyaw']:.1f}"
-            cv2.putText(ego_frame, text, (10, y_offset), font, 0.6, (255, 255, 0), 2)
+            text = f"GT:   dx={
+                gt_pose['dx']:.1f}m, dy={
+                gt_pose['dy']:.1f}m, yaw={
+                gt_pose['dyaw']:.1f}"
+            cv2.putText(ego_frame, text, (10, y_offset),
+                        font, 0.6, (255, 255, 0), 2)
             y_offset += 25
 
             # Error (red/magenta)
             err_dx = estimated_pose['dx'] - gt_pose['dx']
             err_dy = estimated_pose['dy'] - gt_pose['dy']
             err_dyaw = pred_dyaw - gt_pose['dyaw']
-            text = f"Err:  dx={err_dx:.2f}m, dy={err_dy:.2f}m, yaw={err_dyaw:.1f}"
-            cv2.putText(ego_frame, text, (10, y_offset), font, 0.6, (255, 0, 255), 2)
+            text = f"Err:  dx={
+                err_dx:.2f}m, dy={
+                err_dy:.2f}m, yaw={
+                err_dyaw:.1f}"
+            cv2.putText(ego_frame, text, (10, y_offset),
+                        font, 0.6, (255, 0, 255), 2)
             y_offset += 25
 
         # Control (white)
-        text = f"Ctrl: T={control_cmd.throttle:.2f}, S={control_cmd.steer:.2f}, B={control_cmd.brake:.2f}"
-        cv2.putText(ego_frame, text, (10, y_offset), font, 0.6, (255, 255, 255), 2)
+        text = f"Ctrl: T={
+            control_cmd.throttle:.2f}, S={
+            control_cmd.steer:.2f}, B={
+            control_cmd.brake:.2f}"
+        cv2.putText(ego_frame, text, (10, y_offset),
+                    font, 0.6, (255, 255, 255), 2)
         y_offset += 25
 
         # Frame number
         text = f"Frame: {self.frame_count}"
-        cv2.putText(ego_frame, text, (10, y_offset), font, 0.6, (255, 255, 255), 2)
+        cv2.putText(ego_frame, text, (10, y_offset),
+                    font, 0.6, (255, 255, 255), 2)
 
         # Save ego camera image
         ego_path = os.path.join(
@@ -517,8 +550,8 @@ class VehiclePursuit:
             )
 
             spectator_path = os.path.join(
-                self.spectator_output_dir, f"spectator_{self.frame_count:05d}.png"
-            )
+                self.spectator_output_dir, f"spectator_{
+                    self.frame_count:05d}.png")
             cv2.imwrite(spectator_path, spectator_frame)
 
     def _print_final_stats(self) -> None:
@@ -546,22 +579,35 @@ class VehiclePursuit:
                 print(f"  Mean dyaw: {np.mean(dyaw_vals):.2f}°")
 
                 # Compute errors vs GT if available
-                gt_available = [e for e in self.pose_errors if e.get("gt_dx") is not None]
+                gt_available = [
+                    e for e in self.pose_errors if e.get("gt_dx") is not None]
                 if gt_available:
                     err_dx = [e["dx"] - e["gt_dx"] for e in gt_available]
                     err_dy = [e["dy"] - e["gt_dy"] for e in gt_available]
                     err_dyaw = [e["dyaw"] - e["gt_dyaw"] for e in gt_available]
 
-                    print(f"\nPose errors vs ground truth ({len(gt_available)} frames):")
+                    print(
+                        f"\nPose errors vs ground truth ({
+                            len(gt_available)} frames):")
                     print(f"  MAE dx: {np.mean(np.abs(err_dx)):.3f}m")
                     print(f"  MAE dy: {np.mean(np.abs(err_dy)):.3f}m")
                     print(f"  MAE dyaw: {np.mean(np.abs(err_dyaw)):.2f}°")
-                    print(f"  RMSE dx: {np.sqrt(np.mean(np.square(err_dx))):.3f}m")
-                    print(f"  RMSE dy: {np.sqrt(np.mean(np.square(err_dy))):.3f}m")
+                    print(
+                        f"  RMSE dx: {
+                            np.sqrt(
+                                np.mean(
+                                    np.square(err_dx))):.3f}m")
+                    print(
+                        f"  RMSE dy: {
+                            np.sqrt(
+                                np.mean(
+                                    np.square(err_dy))):.3f}m")
 
             if self.config.save_video:
                 print(f"\nEgo images saved to: {self.ego_output_dir}")
-                print(f"Spectator images saved to: {self.spectator_output_dir}")
+                print(
+                    f"Spectator images saved to: {
+                        self.spectator_output_dir}")
 
         print("=" * 60)
 
@@ -690,11 +736,6 @@ def main() -> None:
     config.desired_distance = args.desired_distance
     config.save_video = not args.not_save_images
     config.video_output_dir = args.output_dir
-
-    # Load model config from checkpoint directory
-    config_dir = os.path.dirname(config.checkpoint_path)
-    config.config_path = os.path.join(config_dir, "config.json")
-    config.load_model_config()
 
     # Create pursuit instance
     pursuit = VehiclePursuit(config)

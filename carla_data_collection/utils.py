@@ -154,7 +154,8 @@ def compute_lidar_to_camera_transform(
     return camera_inv @ lidar_matrix
 
 
-def binary_mask_to_bbox(mask: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+def binary_mask_to_bbox(
+        mask: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
     """Return (x1, y1, x2, y2) for a binary mask or None if empty."""
     if mask.size == 0 or not np.any(mask):
         return None
@@ -193,10 +194,17 @@ def deduplicate_mask_candidates(
     iou_thr: float,
 ) -> list[Dict[str, Any]]:
     """Greedily suppress duplicate segmentation masks by score and IoU."""
-    ordered = sorted(candidates, key=lambda item: float(item["score"]), reverse=True)
+    ordered = sorted(
+        candidates,
+        key=lambda item: float(
+            item["score"]),
+        reverse=True)
     kept: list[Dict[str, Any]] = []
     for candidate in ordered:
-        if all(mask_iou(candidate["mask"], prev["mask"]) < iou_thr for prev in kept):
+        if all(
+            mask_iou(
+                candidate["mask"],
+                prev["mask"]) < iou_thr for prev in kept):
             kept.append(candidate)
     return kept
 
@@ -222,7 +230,9 @@ def vehicle_instance_mask_from_array(
     """Return a binary mask for one vehicle instance in a saved raw frame."""
     semantic_tags = extract_semantic_tags(instance_image)
     instance_ids = extract_instance_ids(instance_image)
-    return (semantic_tags == vehicle_semantic_tag) & (instance_ids == instance_id)
+    return (
+        semantic_tags == vehicle_semantic_tag) & (
+        instance_ids == instance_id)
 
 
 def ensure_dir(path: str) -> None:
@@ -247,6 +257,21 @@ def save_binary_mask(mask: np.ndarray, path: str) -> None:
     ensure_dir(os.path.dirname(path))
     mask_u8 = (mask.astype(np.uint8) * 255)
     cv2.imwrite(path, mask_u8)
+
+
+def save_rgb_jpeg(rgb_image: np.ndarray, path: str, quality: int = 95) -> None:
+    """Save an RGB image as a JPEG with the requested quality."""
+    ensure_dir(os.path.dirname(path))
+    bgr = cv2.cvtColor(rgb_image.astype(np.uint8), cv2.COLOR_RGB2BGR)
+    ok, encoded = cv2.imencode(
+        ".jpg",
+        bgr,
+        [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)],
+    )
+    if not ok:
+        raise RuntimeError(f"Failed to encode JPEG image for {path}")
+    with open(path, "wb") as handle:
+        handle.write(encoded.tobytes())
 
 
 def relative_path(path: str, root: str) -> str:
