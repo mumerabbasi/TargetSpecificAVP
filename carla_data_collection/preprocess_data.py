@@ -1,342 +1,193 @@
-"""Preprocess and combine fragmented CARLA datasets into a unified dataset.
+"""Merge multiple per-target RAVP datasets into one dataset root.
 
-This script:
-    1. Scans all dataset directories in the source folder
-    2. Copies images with new sequential frame IDs
-    3. Merges all CSV files with updated frame IDs
-    4. Saves the combined dataset to the destination folder
+Each source dataset is expected to follow the new shared-asset layout:
 
-Usage:
-    python preprocess_data.py --source /path/to/fragments --dest /path/to/combined
+dataset/
+├── rgb/
+├── masks/
+├── gt_poses.csv
+└── pred_poses.csv
+
+The merger:
+1. Copies each RGB frame once with a new global frame id.
+2. Copies each target mask once with a new frame-aware filename.
+3. Rewrites both CSVs so the merged dataset keeps separate GT/pred labels
+   while reusing the shared RGB and mask assets.
 """
 
+from __future__ import annotations
+
 import argparse
+import csv
 import os
 import shutil
-from typing import Any
-
-import pandas as pd
-from tqdm import tqdm
+from collections import defaultdict
+from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 
 
-def scan_datasets(source_base: str) -> list[dict[str, Any]]:
-    """Scan source directory for dataset folders and count images.
-
-    Args:
-        source_base: Path to directory containing dataset folders.
-
-    Returns:
-        List of dicts with dataset info (name, path, num_images, has_csv).
-    """
-    dataset_dirs = sorted([
-        d for d in os.listdir(source_base)
-        if d.startswith("carla_dataset")
-        and os.path.isdir(os.path.join(source_base, d))
-    ])
-
-    print(f"Found {len(dataset_dirs)} dataset directories:")
-
-    dataset_info = []
-    for d in dataset_dirs:
-        dir_path = os.path.join(source_base, d)
-        png_files = [f for f in os.listdir(dir_path) if f.endswith(".png")]
-        csv_path = os.path.join(dir_path, "poses.csv")
-        has_csv = os.path.exists(csv_path)
-
-        info = {
-            "name": d,
-            "path": dir_path,
-            "num_images": len(png_files),
-            "has_csv": has_csv,
-        }
-        dataset_info.append(info)
-        print(f"  {d}: {len(png_files):,} images, CSV: {has_csv}")
-
-    total_images = sum(d["num_images"] for d in dataset_info)
-    print(f"\nTotal images to combine: {total_images:,}")
-
-    return dataset_info
+CSV_FIELDNAMES = [
+    "sample_id",
+    "frame_id",
+    "episode_id",
+    "town",
+    "tick",
+    "actor_id",
+    "rgb_path",
+    "mask_path",
+    "bbox_x1",
+    "bbox_y1",
+    "bbox_x2",
+    "bbox_y2",
+    "mask_area_px",
+    "dx_m",
+    "dy_m",
+    "dz_m",
+    "yaw_deg",
+    "pose_score",
+]
 
 
-def combine_datasets(
-    dataset_info: list[dict[str, Any]],
-    dest_base: str,
-) -> pd.DataFrame:
-    """Combine all datasets by copying images and merging CSVs.
+def _read_csv_rows(csv_path: str) -> List[Dict[str, str]]:
+    if not os.path.exists(csv_path):
+        return []
+    with open(csv_path, "r", newline="") as handle:
+        return list(csv.DictReader(handle))
 
-    Images are grouped by town so that all frames from the same town
-    have consecutive frame IDs in the final dataset.
 
-    Args:
-        dataset_info: List of dataset info dicts from scan_datasets().
-        dest_base: Destination directory for combined dataset.
-
-    Returns:
-        Combined DataFrame with all poses.
-    """
-    os.makedirs(dest_base, exist_ok=True)
-    rgb_dir = os.path.join(dest_base, "rgb")
-    os.makedirs(rgb_dir, exist_ok=True)
-    print(f"\nDestination directory: {dest_base}")
-    print(f"RGB directory: {rgb_dir}")
-
-    # =================================================================
-    # PHASE 1: Load all CSVs to build frame-to-town mapping
-    # =================================================================
-    print("\nPhase 1: Loading CSVs to determine town for each frame...")
-
-    # Collect all frames: list of (dataset_name, old_frame_id, town, img_path)
-    # Only include frames that have CSV entries (poses)
-    all_frames: list[tuple[str, int, str, str]] = []
-    all_dfs: list[pd.DataFrame] = []
-
-    for info in tqdm(dataset_info, desc="Loading CSVs"):
-        if info["num_images"] == 0:
+def _discover_dataset_roots(source_root: str, dest_root: str) -> List[str]:
+    datasets: List[str] = []
+    for name in sorted(os.listdir(source_root)):
+        path = os.path.join(source_root, name)
+        if not os.path.isdir(path):
             continue
-
-        dataset_path = info["path"]
-        dataset_name = info["name"]
-        csv_path = os.path.join(dataset_path, "poses.csv")
-
-        if not os.path.exists(csv_path):
-            print(f"  WARNING: No CSV for {dataset_name}, skipping")
+        if os.path.abspath(path) == os.path.abspath(dest_root):
             continue
-
-        df = pd.read_csv(csv_path)
-        df["_dataset_name"] = dataset_name  # Tag with source dataset
-        all_dfs.append(df)
-
-        # Build frame-to-town mapping from CSV
-        # Each frame_id maps to exactly one town
-        frame_to_town: dict[int, str] = {}
-        for _, row in df.iterrows():
-            frame_to_town[row["frame_id"]] = row["town"]
-
-        # Get unique frame IDs from CSV (frames with poses)
-        csv_frame_ids = set(df["frame_id"].unique())
-
-        # Collect only image files that have corresponding CSV entries
-        png_files = sorted([
-            f for f in os.listdir(dataset_path) if f.endswith(".png")
-        ])
-
-        skipped_count = 0
-        for png_file in png_files:
-            old_frame_id = int(
-                png_file.replace("rgb_", "").replace(".png", "")
-            )
-            # Skip frames without CSV entries (no poses)
-            if old_frame_id not in csv_frame_ids:
-                skipped_count += 1
-                continue
-            town = frame_to_town[old_frame_id]
-            img_path = os.path.join(dataset_path, png_file)
-            all_frames.append((dataset_name, old_frame_id, town, img_path))
-
-        if skipped_count > 0:
-            print(f"  {dataset_name}: skipped {skipped_count} frames without poses")
-
-    print(f"  Total frames collected (with poses): {len(all_frames):,}")
-
-    # =================================================================
-    # PHASE 2: Group frames by town and sort
-    # =================================================================
-    print("\nPhase 2: Grouping frames by town...")
-
-    # Group by town
-    town_frames: dict[str, list[tuple[str, int, str]]] = {}
-    for dataset_name, old_frame_id, town, img_path in all_frames:
-        if town not in town_frames:
-            town_frames[town] = []
-        town_frames[town].append((dataset_name, old_frame_id, img_path))
-
-    # Sort towns alphabetically for consistent ordering
-    sorted_towns = sorted(town_frames.keys())
-
-    print(f"  Found {len(sorted_towns)} towns:")
-    for town in sorted_towns:
-        print(f"    {town}: {len(town_frames[town]):,} frames")
-
-    # =================================================================
-    # PHASE 3: Assign new frame IDs and copy images (grouped by town)
-    # =================================================================
-    print("\nPhase 3: Copying images grouped by town...")
-
-    global_frame_id = 0
-    frame_id_mapping: dict[tuple[str, int], int] = {}
-    town_ranges: dict[str, tuple[int, int]] = {}  # town -> (start_id, end_id)
-
-    for town in tqdm(sorted_towns, desc="Processing towns"):
-        town_start_id = global_frame_id
-        frames = town_frames[town]
-
-        for dataset_name, old_frame_id, img_path in tqdm(
-            frames, desc=f"Copying {town}", leave=False
+        if os.path.exists(os.path.join(path, "gt_poses.csv")) or os.path.exists(
+            os.path.join(path, "pred_poses.csv")
         ):
-            # Map (dataset_name, old_frame_id) -> new global frame_id
-            frame_id_mapping[(dataset_name, old_frame_id)] = global_frame_id
-
-            # Copy image with new name
-            dst_path = os.path.join(rgb_dir, f"rgb_{global_frame_id:05d}.png")
-            shutil.copy2(img_path, dst_path)
-
-            global_frame_id += 1
-
-        town_end_id = global_frame_id - 1
-        town_ranges[town] = (town_start_id, town_end_id)
-
-    print(f"\nTotal frames copied: {global_frame_id:,}")
-    print("\nTown frame ID ranges:")
-    for town in sorted_towns:
-        start_id, end_id = town_ranges[town]
-        count = end_id - start_id + 1
-        print(f"  {town}: {start_id:,} - {end_id:,} ({count:,} frames)")
-
-    # =================================================================
-    # PHASE 4: Update frame IDs in combined DataFrame
-    # =================================================================
-    print("\nPhase 4: Updating frame IDs in CSV...")
-
-    if all_dfs:
-        combined_df = pd.concat(all_dfs, ignore_index=True)
-
-        # Update frame_ids using the mapping
-        # Use -1 as sentinel for unmapped entries (should not happen)
-        def map_frame_id(row: pd.Series) -> int:
-            key = (row["_dataset_name"], row["frame_id"])
-            if key in frame_id_mapping:
-                return frame_id_mapping[key]
-            else:
-                # This should not happen if data is consistent
-                print(
-                    f"  WARNING: No mapping for {key}, "
-                    "row will be dropped"
-                )
-                return -1
-
-        combined_df["frame_id"] = combined_df.apply(map_frame_id, axis=1)
-
-        # Drop rows that couldn't be mapped (shouldn't happen normally)
-        unmapped_count = (combined_df["frame_id"] == -1).sum()
-        if unmapped_count > 0:
-            print(f"  WARNING: Dropping {unmapped_count} rows without mapping")
-            combined_df = combined_df[combined_df["frame_id"] != -1]
-
-        # Remove the temporary column
-        combined_df = combined_df.drop(columns=["_dataset_name"])
-        # Sort by frame_id so CSV is ordered by town groups
-        combined_df = combined_df.sort_values("frame_id").reset_index(drop=True)
-    else:
-        combined_df = pd.DataFrame()
-
-    return combined_df
+            datasets.append(path)
+    return datasets
 
 
-def save_combined_csv(combined_df: pd.DataFrame, dest_base: str) -> None:
-    """Save the combined DataFrame to CSV.
-
-    Args:
-        combined_df: DataFrame with all combined poses.
-        dest_base: Destination directory for combined dataset.
-    """
-    combined_csv_path = os.path.join(dest_base, "poses.csv")
-    combined_df.to_csv(combined_csv_path, index=False)
-
-    print(f"\nCombined CSV saved to: {combined_csv_path}")
-    print(f"Total detection rows: {len(combined_df):,}")
-    print(f"Unique frame_ids: {combined_df['frame_id'].nunique():,}")
-    if len(combined_df) > 0:
-        frame_min = combined_df["frame_id"].min()
-        frame_max = combined_df["frame_id"].max()
-        print(f"Frame ID range: {frame_min} - {frame_max}")
+def _ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
 
 
-def verify_combined_dataset(dest_base: str, combined_df: pd.DataFrame) -> None:
-    """Verify the combined dataset integrity.
+def _copy_once(src: str, dst: str) -> None:
+    _ensure_dir(os.path.dirname(dst))
+    if os.path.exists(dst):
+        return
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
 
-    Args:
-        dest_base: Destination directory containing combined dataset.
-        combined_df: DataFrame with all combined poses.
-    """
-    rgb_dir = os.path.join(dest_base, "rgb")
-    dest_images = [f for f in os.listdir(rgb_dir) if f.endswith(".png")]
-    dest_images_sorted = sorted(dest_images)
 
-    print("\nVerification:")
-    print(f"  Images in destination: {len(dest_images):,}")
-    print(f"  CSV rows: {len(combined_df):,}")
-    print(f"  Unique frames in CSV: {combined_df['frame_id'].nunique():,}")
+def _collect_unique_frames(
+    rows_by_split: Mapping[str, Sequence[Mapping[str, str]]],
+) -> Dict[str, List[Mapping[str, str]]]:
+    grouped: Dict[str, List[Mapping[str, str]]] = defaultdict(list)
+    for rows in rows_by_split.values():
+        for row in rows:
+            grouped[row["rgb_path"]].append(row)
+    return grouped
 
-    if dest_images_sorted:
-        print(f"  First image: {dest_images_sorted[0]}")
-        print(f"  Last image: {dest_images_sorted[-1]}")
 
-    csv_frame_ids = set(combined_df["frame_id"].unique())
-    image_frame_ids = set()
-    for img in dest_images:
-        frame_id = int(img.replace("rgb_", "").replace(".png", ""))
-        image_frame_ids.add(frame_id)
-
-    missing_in_images = csv_frame_ids - image_frame_ids
-    missing_in_csv = image_frame_ids - csv_frame_ids
-
-    if missing_in_images:
-        print(
-            f"  WARNING: {len(missing_in_images)} frame_ids in CSV "
-            "but no image file"
+def combine_datasets(source_root: str, dest_root: str) -> Tuple[int, int, int]:
+    dataset_roots = _discover_dataset_roots(source_root, dest_root)
+    if not dataset_roots:
+        raise FileNotFoundError(
+            f"No built per-target datasets found under {source_root}"
         )
-    if missing_in_csv:
-        print(f"  WARNING: {len(missing_in_csv)} images without CSV entries")
 
-    if not missing_in_images and not missing_in_csv:
-        print("  ✓ All images have corresponding CSV entries")
+    rgb_dest_dir = os.path.join(dest_root, "rgb")
+    mask_dest_dir = os.path.join(dest_root, "masks")
+    _ensure_dir(dest_root)
+    _ensure_dir(rgb_dest_dir)
+    _ensure_dir(mask_dest_dir)
+
+    combined_gt_rows: List[Dict[str, str]] = []
+    combined_pred_rows: List[Dict[str, str]] = []
+    next_frame_id = 0
+    copied_masks: Dict[Tuple[str, str], str] = {}
+
+    for dataset_root in dataset_roots:
+        gt_rows = _read_csv_rows(os.path.join(dataset_root, "gt_poses.csv"))
+        pred_rows = _read_csv_rows(os.path.join(dataset_root, "pred_poses.csv"))
+        grouped_frames = _collect_unique_frames({"gt": gt_rows, "pred": pred_rows})
+        rgb_mapping: Dict[str, Tuple[int, str]] = {}
+
+        for old_rgb_rel in sorted(grouped_frames.keys()):
+            src_rgb = os.path.join(dataset_root, old_rgb_rel)
+            _, ext = os.path.splitext(old_rgb_rel)
+            if not ext:
+                ext = ".png"
+            new_rgb_rel = os.path.join("rgb", f"frame_{next_frame_id:06d}{ext}")
+            _copy_once(src_rgb, os.path.join(dest_root, new_rgb_rel))
+            rgb_mapping[old_rgb_rel] = (next_frame_id, new_rgb_rel.replace(os.sep, "/"))
+            next_frame_id += 1
+
+        for rows, target in (
+            (gt_rows, combined_gt_rows),
+            (pred_rows, combined_pred_rows),
+        ):
+            for row in rows:
+                new_frame_id, new_rgb_rel = rgb_mapping[row["rgb_path"]]
+                actor_id = int(row["actor_id"])
+                mask_key = (dataset_root, row["mask_path"])
+                if mask_key not in copied_masks:
+                    src_mask = os.path.join(dataset_root, row["mask_path"])
+                    new_mask_rel = os.path.join(
+                        "masks",
+                        f"frame_{new_frame_id:06d}_actor_{actor_id}.png",
+                    ).replace(os.sep, "/")
+                    _copy_once(src_mask, os.path.join(dest_root, new_mask_rel))
+                    copied_masks[mask_key] = new_mask_rel
+
+                merged_row = dict(row)
+                merged_row["frame_id"] = str(new_frame_id)
+                merged_row["sample_id"] = f"{new_frame_id:06d}_{actor_id}"
+                merged_row["rgb_path"] = new_rgb_rel
+                merged_row["mask_path"] = copied_masks[mask_key]
+                target.append(merged_row)
+
+    with open(os.path.join(dest_root, "gt_poses.csv"), "w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CSV_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(combined_gt_rows)
+
+    with open(os.path.join(dest_root, "pred_poses.csv"), "w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CSV_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(combined_pred_rows)
+
+    return next_frame_id, len(combined_gt_rows), len(combined_pred_rows)
 
 
-def main() -> None:
-    """Main entry point for the dataset combiner."""
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Combine fragmented CARLA datasets into a unified dataset"
+        description="Merge multiple built per-target RAVP datasets"
     )
     parser.add_argument(
         "--source",
-        type=str,
-        default="/storage/remote/atcremers45/s0050/carla_data_3d_detector",
-        help="Source directory containing fragmented dataset folders",
+        required=True,
+        help="Directory containing one or more built dataset roots",
     )
     parser.add_argument(
         "--dest",
-        type=str,
-        default="/storage/remote/atcremers45/s0050/carla_dataset",
-        help="Destination directory for combined dataset",
+        required=True,
+        help="Destination directory for the merged dataset",
     )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Only scan and report, don't copy files",
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    frames, gt_rows, pred_rows = combine_datasets(args.source, args.dest)
+    print(
+        f"Merged dataset written to {args.dest}: "
+        f"{frames} frames, {gt_rows} GT rows, {pred_rows} predicted rows"
     )
-
-    args = parser.parse_args()
-
-    print("=" * 60)
-    print("CARLA Dataset Combiner")
-    print("=" * 60)
-    print(f"Source: {args.source}")
-    print(f"Destination: {args.dest}")
-    print()
-
-    dataset_info = scan_datasets(args.source)
-
-    if args.dry_run:
-        print("\n[DRY RUN] No files copied.")
-        return
-
-    combined_df = combine_datasets(dataset_info, args.dest)
-    save_combined_csv(combined_df, args.dest)
-    verify_combined_dataset(args.dest, combined_df)
-
-    print("\n" + "=" * 60)
-    print("Dataset combination complete!")
-    print("=" * 60)
 
 
 if __name__ == "__main__":

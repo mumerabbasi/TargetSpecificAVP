@@ -1,35 +1,29 @@
-"""3D detection with CenterPoint."""
+"""Generic MMDetection3D inference wrapper for per-frame pose labels."""
 
+from __future__ import annotations
+
+from dataclasses import dataclass
 from typing import Any, Dict, List
 
 import numpy as np
-from mmdet3d.apis import inference_detector, init_model
+import torch
 
 from .utils import carla_to_nuscenes_points, nuscenes_to_carla_box
 
 
-def load_centerpoint_model(
-    config_file: str,
-    checkpoint_file: str,
-    device: str = "cuda:0",
-) -> Any:
-    """
-    Load CenterPoint model.
+@dataclass
+class DetectorSpec:
+    """Configuration for an MMDetection3D LiDAR detector."""
 
-    Args:
-        config_file: Path to model config.
-        checkpoint_file: Path to model checkpoint.
-        device: Device for inference.
-
-    Returns:
-        Initialized model.
-    """
-    print("Initializing CenterPoint model...")
-    return init_model(config_file, checkpoint_file, device=device)
+    name: str
+    config_path: str
+    checkpoint_path: str
+    score_thr: float = 0.15
+    device: str = "cuda:0"
 
 
 def extract_data_sample(det_output: Any) -> Any:
-    """Extract Det3DDataSample from inference output."""
+    """Extract a Det3DDataSample from varying MMDet3D output shapes."""
     if hasattr(det_output, "pred_instances_3d"):
         return det_output
     if isinstance(det_output, list):
@@ -47,53 +41,75 @@ def extract_data_sample(det_output: Any) -> Any:
     raise RuntimeError("Could not find Det3DDataSample in inference output.")
 
 
-def run_centerpoint_detection(
-    model: Any,
-    points_carla: np.ndarray,
-    score_thr: float = 0.15,
-) -> List[Dict[str, Any]]:
-    """
-    Run CenterPoint on filtered CARLA LiDAR points.
+class MMDet3DDetector:
+    """Run full-frame LiDAR detection with a configurable MMDet3D model."""
 
-    Args:
-        model: CenterPoint model.
-        points_carla: Nx4 CARLA LiDAR points.
-        score_thr: Score threshold for detections.
+    def __init__(self, spec: DetectorSpec) -> None:
+        self.spec = spec
+        try:
+            from mmdet3d.apis import init_model
+        except ImportError as exc:
+            raise ImportError(
+                "mmdet3d is required for offline predicted-pose generation."
+            ) from exc
 
-    Returns:
-        List of detections with center, dims, yaw, score.
-    """
-    if len(points_carla) < 10:
-        return []
+        self.device = spec.device
+        if self.device.startswith("cuda") and not torch.cuda.is_available():
+            print("[detector] CUDA unavailable, falling back to CPU")
+            self.device = "cpu"
 
-    points_nus = carla_to_nuscenes_points(points_carla)
-    det_output = inference_detector(model, points_nus)
-    det_sample = extract_data_sample(det_output)
+        print(f"Initializing {spec.name} from {spec.config_path}")
+        self._inference_detector = self._load_inference_detector()
+        self.model = init_model(
+            spec.config_path,
+            spec.checkpoint_path,
+            device=self.device,
+        )
 
-    pred = det_sample.pred_instances_3d
-    bboxes_3d = pred.bboxes_3d.tensor.cpu().numpy()
-    scores_3d = pred.scores_3d.cpu().numpy()
-    labels_3d = pred.labels_3d.cpu().numpy()
+    def _load_inference_detector(self):
+        from mmdet3d.apis import inference_detector
 
-    # Filter by class (car)
-    class_names = getattr(model, "dataset_meta", {}).get("classes", None)
-    if class_names is not None:
-        car_ids = [i for i, name in enumerate(class_names) if name.lower() == "car"]
-        if car_ids:
-            mask_cls = np.isin(labels_3d, car_ids)
-            bboxes_3d = bboxes_3d[mask_cls]
-            scores_3d = scores_3d[mask_cls]
-            labels_3d = labels_3d[mask_cls]
+        return inference_detector
 
-    # Filter by score
-    mask_score = scores_3d >= score_thr
-    bboxes_3d = bboxes_3d[mask_score]
-    scores_3d = scores_3d[mask_score]
+    def detect(self, points_carla: np.ndarray) -> List[Dict[str, Any]]:
+        """Run the configured detector on the full frame point cloud."""
+        if len(points_carla) < 10:
+            return []
 
-    detections = []
-    for box, score in zip(bboxes_3d, scores_3d):
-        box_carla = nuscenes_to_carla_box(box)
-        box_carla["score"] = float(score)
-        detections.append(box_carla)
+        points_nus = carla_to_nuscenes_points(points_carla)
+        try:
+            det_output = self._inference_detector(self.model, points_nus)
+        except RuntimeError as exc:
+            message = str(exc)
+            if "not implemented on CPU" in message:
+                raise RuntimeError(
+                    "The configured 3D detector requires CUDA-visible GPUs for "
+                    "inference. Make sure the detector env can see NVIDIA devices."
+                ) from exc
+            raise
+        det_sample = extract_data_sample(det_output)
 
-    return detections
+        pred = det_sample.pred_instances_3d
+        bboxes_3d = pred.bboxes_3d.tensor.cpu().numpy()
+        scores_3d = pred.scores_3d.cpu().numpy()
+        labels_3d = pred.labels_3d.cpu().numpy()
+
+        class_names = getattr(self.model, "dataset_meta", {}).get("classes", None)
+        if class_names is not None:
+            car_ids = [idx for idx, name in enumerate(class_names) if name.lower() == "car"]
+            if car_ids:
+                mask_cls = np.isin(labels_3d, car_ids)
+                bboxes_3d = bboxes_3d[mask_cls]
+                scores_3d = scores_3d[mask_cls]
+
+        mask_score = scores_3d >= self.spec.score_thr
+        bboxes_3d = bboxes_3d[mask_score]
+        scores_3d = scores_3d[mask_score]
+
+        detections: List[Dict[str, Any]] = []
+        for box, score in zip(bboxes_3d, scores_3d):
+            box_carla = nuscenes_to_carla_box(box)
+            box_carla["score"] = float(score)
+            detections.append(box_carla)
+
+        return detections
