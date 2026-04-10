@@ -2,10 +2,23 @@
 
 from __future__ import annotations
 
-import math
 import os
 from dataclasses import dataclass, field
 from typing import Sequence, Tuple
+
+
+DEFAULT_TOWNS: Tuple[str, ...] = (
+    "Town01",
+    "Town01_Opt",
+    "Town02",
+    "Town02_Opt",
+    "Town03",
+    "Town03_Opt",
+    "Town04",
+    "Town04_Opt",
+    "Town05",
+    "Town05_Opt",
+)
 
 
 @dataclass
@@ -44,7 +57,7 @@ class Config:
     # ------------------------------------------------------------------
     # Collection settings
     # ------------------------------------------------------------------
-    towns: Tuple[str, ...] = ("Town01", "Town02", "Town03", "Town04", "Town05")
+    towns: Tuple[str, ...] = DEFAULT_TOWNS
     target_samples_per_town: int = 3000
     max_frames_per_town: int = 12000
     max_episodes_per_town: int = 4
@@ -91,9 +104,6 @@ class Config:
     # Used to keep long-range samples from being drowned out by near traffic.
     distance_bins_m: Tuple[float, ...] = (
         0.0, 5.0, 10.0, 15.0, 20.0, 30.0, 40.0)
-    lateral_bins_m: Tuple[float, ...] = (0.0, 1.5, 3.5, 1000.0)
-    yaw_bins_deg: Tuple[float, ...] = (0.0, 10.0, 30.0, 60.0, 120.0, 180.0)
-
     # ------------------------------------------------------------------
     # SAM3 mask generation
     # ------------------------------------------------------------------
@@ -178,8 +188,3 @@ class Config:
             self.rgb_dir,
             self.masks_dir,
         )
-
-    @property
-    def per_distance_bin_target(self) -> int:
-        num_bins = max(len(self.distance_bins_m) - 1, 1)
-        return max(1, math.ceil(self.target_samples_per_town / num_bins))

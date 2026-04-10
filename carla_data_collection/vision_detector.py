@@ -1,4 +1,4 @@
-"""SAM3-based vehicle mask generation for offline dataset building."""
+"""SAM3-based vehicle mask generation for compact dataset collection."""
 
 from __future__ import annotations
 
@@ -35,7 +35,8 @@ class VisionDetector:
             from sam3.model_builder import build_sam3_image_model
         except ImportError as exc:
             raise ImportError(
-                "sam3 must be importable in the offline build environment."
+                "sam3 must be importable in the compact collection "
+                "environment."
             ) from exc
 
         print("Loading SAM3 image model...")
@@ -88,19 +89,6 @@ class VisionDetector:
             )
 
         return deduplicate_mask_candidates(candidates, self.duplicate_iou_thr)
-
-    def detect_and_segment(
-            self, rgb_image: np.ndarray) -> List[Dict[str, Any]]:
-        """Return SAM3 masks, bboxes, and confidence scores for vehicles."""
-        state = self.set_image(rgb_image)
-        results = self.processor.set_text_prompt(self.prompt, state)
-
-        if len(results["scores"]) == 0 and self.fallback_prompt:
-            self.processor.reset_all_prompts(state)
-            results = self.processor.set_text_prompt(
-                self.fallback_prompt, state)
-
-        return self._results_to_candidates(results)
 
     def segment_from_box(
         self,

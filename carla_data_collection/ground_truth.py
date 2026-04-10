@@ -1,9 +1,9 @@
-"""Ground-truth helpers shared by capture, build, and benchmarking."""
+"""Ground-truth helpers for compact collection and reporting."""
 
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping
 
 import numpy as np
 
@@ -114,61 +114,3 @@ def match_detections_to_actor_records(
         matched_actors.add(actor_idx)
 
     return matches
-
-
-def compute_pose_errors(
-    actor_records: List[Mapping[str, object]],
-    matches: Mapping[int, Mapping[str, object]],
-) -> Dict[str, float]:
-    """Compute aggregate detection errors for benchmark reporting."""
-    errors_dx: List[float] = []
-    errors_dy: List[float] = []
-    errors_dz: List[float] = []
-    errors_yaw: List[float] = []
-    errors_yaw_mod_180: List[float] = []
-
-    actor_lookup = {int(actor["actor_id"]): actor for actor in actor_records}
-    for actor_id, det in matches.items():
-        actor = actor_lookup.get(int(actor_id))
-        if actor is None:
-            continue
-
-        center = det["center"]
-        if isinstance(center, list):
-            center = np.asarray(center, dtype=np.float32)
-
-        errors_dx.append(float(center[0]) - float(actor["dx_m"]))
-        errors_dy.append(float(center[1]) - float(actor["dy_m"]))
-        errors_dz.append(float(center[2]) - float(actor["dz_m"]))
-        yaw_error = float(
-            wrap_angle_deg(float(det["yaw_deg"]) - float(actor["yaw_deg"]))
-        )
-        errors_yaw.append(yaw_error)
-        errors_yaw_mod_180.append(
-            float(
-                min(
-                    abs(yaw_error),
-                    abs(wrap_angle_deg(yaw_error - 180.0)),
-                    abs(wrap_angle_deg(yaw_error + 180.0)),
-                )
-            )
-        )
-
-    if not errors_dx:
-        return {
-            "matched_samples": 0.0,
-            "mae_dx_m": 0.0,
-            "mae_dy_m": 0.0,
-            "mae_dz_m": 0.0,
-            "mae_yaw_deg": 0.0,
-            "mae_yaw_deg_mod_180": 0.0,
-        }
-
-    return {
-        "matched_samples": float(len(errors_dx)),
-        "mae_dx_m": float(np.mean(np.abs(errors_dx))),
-        "mae_dy_m": float(np.mean(np.abs(errors_dy))),
-        "mae_dz_m": float(np.mean(np.abs(errors_dz))),
-        "mae_yaw_deg": float(np.mean(np.abs(errors_yaw))),
-        "mae_yaw_deg_mod_180": float(np.mean(np.abs(errors_yaw_mod_180))),
-    }

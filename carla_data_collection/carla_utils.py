@@ -1,4 +1,4 @@
-"""CARLA helpers for the raw-capture stage."""
+"""CARLA helpers for the compact single-pass collection pipeline."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import carla
-import cv2
 import numpy as np
 
 from .config import Config
@@ -346,13 +345,6 @@ def parse_rgb_image(image: carla.Image) -> np.ndarray:
     array = np.frombuffer(image.raw_data, dtype=np.uint8)
     array = array.reshape((image.height, image.width, 4))
     return array[:, :, :3][:, :, ::-1].copy()
-
-
-def save_rgb_image(image: carla.Image, path: str) -> None:
-    """Save a CARLA RGB image to disk."""
-    array = np.frombuffer(image.raw_data, dtype=np.uint8)
-    array = array.reshape((image.height, image.width, 4))
-    cv2.imwrite(path, array[:, :, :3])
 
 
 def parse_instance_image(image: carla.Image) -> np.ndarray:

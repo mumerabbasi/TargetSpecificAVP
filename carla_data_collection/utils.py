@@ -1,10 +1,9 @@
-"""Utility helpers for geometry, masks, and file handling."""
+"""Utility helpers for the compact CARLA dataset pipeline."""
 
 from __future__ import annotations
 
 import math
 import os
-import shutil
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import cv2
@@ -30,33 +29,6 @@ def get_camera_intrinsic(width: int, height: int, fov: float) -> np.ndarray:
         [[focal, 0, cx], [0, focal, cy], [0, 0, 1]],
         dtype=np.float64,
     )
-
-
-def project_lidar_to_camera(
-    points_lidar: np.ndarray,
-    lidar_to_camera: np.ndarray,
-    intrinsic: np.ndarray,
-    img_width: int,
-    img_height: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Project LiDAR points into image space."""
-    n_points = points_lidar.shape[0]
-    points_hom = np.hstack([points_lidar[:, :3], np.ones((n_points, 1))])
-    points_cam = (lidar_to_camera @ points_hom.T).T
-
-    x_cam = points_cam[:, 1]
-    y_cam = -points_cam[:, 2]
-    z_cam = points_cam[:, 0]
-
-    valid_depth = z_cam > 0.1
-    u = (intrinsic[0, 0] * x_cam / z_cam) + intrinsic[0, 2]
-    v = (intrinsic[1, 1] * y_cam / z_cam) + intrinsic[1, 2]
-
-    valid_bounds = (u >= 0) & (u < img_width) & (v >= 0) & (v < img_height)
-    valid_mask = valid_depth & valid_bounds
-    uv = np.stack([u, v], axis=1)
-
-    return uv, valid_mask, z_cam
 
 
 def project_world_points_to_image(
@@ -85,32 +57,6 @@ def project_world_points_to_image(
     uv = np.stack([u, v], axis=1)
 
     return uv, valid_mask, z_cam
-
-
-def filter_points_by_mask(
-    points_lidar: np.ndarray,
-    uv: np.ndarray,
-    valid_mask: np.ndarray,
-    binary_mask: np.ndarray,
-) -> np.ndarray:
-    """Filter LiDAR points that project inside a binary mask."""
-    filtered_indices = []
-    for i in range(len(points_lidar)):
-        if not valid_mask[i]:
-            continue
-
-        u, v = int(uv[i, 0]), int(uv[i, 1])
-        if u < 0 or u >= binary_mask.shape[1]:
-            continue
-        if v < 0 or v >= binary_mask.shape[0]:
-            continue
-        if binary_mask[v, u]:
-            filtered_indices.append(i)
-
-    if not filtered_indices:
-        return np.empty((0, 4), dtype=np.float32)
-
-    return points_lidar[filtered_indices]
 
 
 def carla_to_nuscenes_points(points_carla: np.ndarray) -> np.ndarray:
@@ -143,15 +89,6 @@ def nuscenes_to_carla_box(box_nus: np.ndarray) -> Dict[str, Any]:
         "yaw": float(wrap_angle_rad(yaw_carla)),
         "yaw_deg": float(math.degrees(wrap_angle_rad(yaw_carla))),
     }
-
-
-def compute_lidar_to_camera_transform(
-    lidar_matrix: np.ndarray,
-    camera_matrix: np.ndarray,
-) -> np.ndarray:
-    """Compute a LiDAR-to-camera rigid transform."""
-    camera_inv = np.linalg.inv(camera_matrix)
-    return camera_inv @ lidar_matrix
 
 
 def binary_mask_to_bbox(
@@ -209,47 +146,9 @@ def deduplicate_mask_candidates(
     return kept
 
 
-def extract_instance_ids(instance_image: np.ndarray) -> np.ndarray:
-    """Extract packed instance ids from a CARLA BGRA instance image."""
-    return (
-        instance_image[:, :, 0].astype(np.uint32)
-        + instance_image[:, :, 1].astype(np.uint32) * 256
-    )
-
-
-def extract_semantic_tags(instance_image: np.ndarray) -> np.ndarray:
-    """Extract semantic tags from a CARLA BGRA instance image."""
-    return instance_image[:, :, 2]
-
-
-def vehicle_instance_mask_from_array(
-    instance_image: np.ndarray,
-    instance_id: int,
-    vehicle_semantic_tag: int,
-) -> np.ndarray:
-    """Return a binary mask for one vehicle instance in a saved raw frame."""
-    semantic_tags = extract_semantic_tags(instance_image)
-    instance_ids = extract_instance_ids(instance_image)
-    return (
-        semantic_tags == vehicle_semantic_tag) & (
-        instance_ids == instance_id)
-
-
 def ensure_dir(path: str) -> None:
     """Create a directory if needed."""
     os.makedirs(path, exist_ok=True)
-
-
-def link_or_copy(src: str, dst: str) -> None:
-    """Hard-link a file when possible, otherwise fall back to copy."""
-    ensure_dir(os.path.dirname(dst))
-    if os.path.exists(dst):
-        return
-
-    try:
-        os.link(src, dst)
-    except OSError:
-        shutil.copy2(src, dst)
 
 
 def save_binary_mask(mask: np.ndarray, path: str) -> None:

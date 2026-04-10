@@ -1,5 +1,5 @@
 """Per-target CARLA dataset collection package."""
 
-from .config import Config
+from .config import DEFAULT_TOWNS, Config
 
-__all__ = ["Config"]
+__all__ = ["Config", "DEFAULT_TOWNS"]

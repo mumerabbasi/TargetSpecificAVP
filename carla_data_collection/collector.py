@@ -97,9 +97,8 @@ def _sample_id(frame_id: int, actor_id: int) -> str:
 def _mask_path_for_frame(config: Config, frame_id: int, actor_id: int) -> str:
     return os.path.join(
         config.masks_dir,
-        f"frame_{
-            frame_id:06d}_actor_{
-            int(actor_id)}.png")
+        f"frame_{frame_id:06d}_actor_{int(actor_id)}.png",
+    )
 
 
 def _rgb_path_for_frame(config: Config, frame_id: int) -> str:
@@ -144,16 +143,16 @@ def _append_csv_rows(path: str, rows: Sequence[Mapping[str, object]]) -> None:
 
 
 def _prune_untracked_files(
-        directory: str,
-        valid_relative_paths: Iterable[str],
-        root_dir: str) -> None:
+    directory: str,
+    valid_relative_paths: Iterable[str],
+    root_dir: str,
+) -> None:
     if not os.path.isdir(directory):
         return
     valid_paths = {
-        os.path.normpath(
-            os.path.join(
-                root_dir,
-                rel_path)) for rel_path in valid_relative_paths}
+        os.path.normpath(os.path.join(root_dir, rel_path))
+        for rel_path in valid_relative_paths
+    }
     for name in os.listdir(directory):
         path = os.path.join(directory, name)
         if os.path.isdir(path):
@@ -188,17 +187,10 @@ class DatasetWriter:
         gt_rows = self._reconcile_csv(config.gt_csv_path, valid_sample_ids)
         pred_rows = self._reconcile_csv(config.pred_csv_path, valid_sample_ids)
 
-        valid_rgb_paths = [str(record["rgb_path"])
-                           for record in self.manifest_records]
+        valid_rgb_paths = [str(record["rgb_path"]) for record in self.manifest_records]
         valid_mask_paths = [str(row["mask_path"]) for row in gt_rows]
-        _prune_untracked_files(
-            config.rgb_dir,
-            valid_rgb_paths,
-            config.output_dir)
-        _prune_untracked_files(
-            config.masks_dir,
-            valid_mask_paths,
-            config.output_dir)
+        _prune_untracked_files(config.rgb_dir, valid_rgb_paths, config.output_dir)
+        _prune_untracked_files(config.masks_dir, valid_mask_paths, config.output_dir)
 
         self.next_frame_id = (
             max(
@@ -208,25 +200,31 @@ class DatasetWriter:
             + 1
         )
         self.frames_per_town: Counter[str] = Counter(
-            str(record["town"]) for record in self.manifest_records)
+            str(record["town"]) for record in self.manifest_records
+        )
         self.gt_samples_per_town: Counter[str] = Counter()
         self.pred_samples_per_town: Counter[str] = Counter(
-            str(row["town"]) for row in pred_rows)
-        self.distance_bins_per_town: Dict[str,
-                                          Counter[int]] = defaultdict(Counter)
+            str(row["town"]) for row in pred_rows
+        )
+        self.distance_bins_per_town: Dict[str, Counter[int]] = defaultdict(Counter)
         self.max_episode_id_per_town: Dict[str, int] = defaultdict(lambda: -1)
+        self._town_order: List[str] = []
         for record in self.manifest_records:
             town = str(record["town"])
+            self._remember_town(town)
             self.max_episode_id_per_town[town] = max(
                 int(self.max_episode_id_per_town[town]),
                 int(record["episode_id"]),
             )
         for row in gt_rows:
             town = str(row["town"])
+            self._remember_town(town)
             self.gt_samples_per_town[town] += 1
             bin_idx = distance_bin_index(
                 float(row["dx_m"]), self.config.distance_bins_m)
             self.distance_bins_per_town[town][bin_idx] += 1
+        for row in pred_rows:
+            self._remember_town(str(row["town"]))
 
         self.bytes_rgb = _directory_size(self.config.rgb_dir)
         self.bytes_masks = _directory_size(self.config.masks_dir)
@@ -234,6 +232,13 @@ class DatasetWriter:
         self._ensure_csv_exists(config.gt_csv_path)
         self._ensure_csv_exists(config.pred_csv_path)
         self.write_summary()
+
+    def _remember_town(self, town: str) -> None:
+        if town not in self._town_order:
+            self._town_order.append(town)
+
+    def _summary_towns(self) -> List[str]:
+        return list(self._town_order)
 
     def _ensure_csv_exists(self, path: str) -> None:
         if not os.path.exists(path):
@@ -362,6 +367,7 @@ class DatasetWriter:
                 "\n")
 
         self.manifest_records.append(manifest_record)
+        self._remember_town(town)
         self.frames_per_town[town] += 1
         self.gt_samples_per_town[town] += len(gt_rows)
         self.pred_samples_per_town[town] += len(pred_rows)
@@ -421,6 +427,7 @@ class DatasetWriter:
         }
 
     def write_summary(self) -> str:
+        towns = self._summary_towns()
         total_frames = int(sum(self.frames_per_town.values()))
         total_gt = int(sum(self.gt_samples_per_town.values()))
         total_pred = int(sum(self.pred_samples_per_town.values()))
@@ -434,7 +441,8 @@ class DatasetWriter:
                 bytes_other += os.path.getsize(path)
         summary = {
             "output_dir": self.config.output_dir,
-            "towns": list(self.config.towns),
+            "configured_towns": list(self.config.towns),
+            "towns": towns,
             "total_frames": total_frames,
             "total_gt_samples": total_gt,
             "total_pred_samples": total_pred,
@@ -455,7 +463,7 @@ class DatasetWriter:
                         )
                     },
                 }
-                for town in self.config.towns
+                for town in towns
             },
         }
         with open(self.config.collection_summary_path, "w") as handle:
@@ -477,7 +485,9 @@ def _directory_size(path: str) -> int:
 
 
 def _valid_mask_candidate(
-        mask: np.ndarray, config: Config) -> Optional[Tuple[int, int, int, int]]:
+    mask: np.ndarray,
+    config: Config,
+) -> Optional[Tuple[int, int, int, int]]:
     bbox = binary_mask_to_bbox(mask)
     if bbox is None:
         return None
@@ -639,18 +649,18 @@ def _attach_detector_predictions(
             if isinstance(center, list):
                 center = np.asarray(center, dtype=np.float32)
             pred_pose = {
-                "dx_m": float(
-                    center[0]), "dy_m": float(
-                    center[1]), "dz_m": float(
-                    center[2]), "yaw_deg": float(
-                    pred_match["yaw_deg"]), "yaw_follow_deg": float(
-                        canonicalize_follow_yaw_deg(
-                            float(
-                                pred_match["yaw_deg"]))), "follow_valid": int(
-                                    sample.actor_record.get(
-                                        "follow_valid", False)), "score": float(
-                                            pred_match.get(
-                                                "score", 0.0)), }
+                "dx_m": float(center[0]),
+                "dy_m": float(center[1]),
+                "dz_m": float(center[2]),
+                "yaw_deg": float(pred_match["yaw_deg"]),
+                "yaw_follow_deg": float(
+                    canonicalize_follow_yaw_deg(float(pred_match["yaw_deg"]))
+                ),
+                "follow_valid": int(
+                    sample.actor_record.get("follow_valid", False)
+                ),
+                "score": float(pred_match.get("score", 0.0)),
+            }
         enriched.append(
             TargetSample(
                 actor_record=sample.actor_record,

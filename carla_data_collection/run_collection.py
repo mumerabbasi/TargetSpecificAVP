@@ -12,7 +12,7 @@ _PARENT_DIR = os.path.dirname(_SCRIPT_DIR)
 if _PARENT_DIR not in sys.path:
     sys.path.insert(0, _PARENT_DIR)
 
-from carla_data_collection import Config  # noqa: E402
+from carla_data_collection import DEFAULT_TOWNS, Config  # noqa: E402
 
 
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
@@ -23,7 +23,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
         "--towns",
         type=str,
         nargs="+",
-        default=["Town01", "Town02", "Town03", "Town04", "Town05"],
+        default=list(DEFAULT_TOWNS),
     )
     parser.add_argument("--follow-only", action="store_true")
     parser.add_argument("--min-follow-actors-per-frame", type=int, default=1)

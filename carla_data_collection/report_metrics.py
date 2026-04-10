@@ -1,4 +1,4 @@
-"""Detailed dataset and detector-vs-GT reporting for per-target CARLA datasets."""
+"""Detailed reporting for compact per-target CARLA datasets."""
 
 from __future__ import annotations
 
@@ -234,11 +234,13 @@ def _dataset_summary(
 def write_detailed_metrics_report(config: Config) -> str:
     if not os.path.exists(config.gt_csv_path):
         raise FileNotFoundError(
-            f"{config.gt_csv_path} not found. Build the GT dataset first."
+            f"{config.gt_csv_path} not found. The compact dataset is missing "
+            "its GT pose table."
         )
     if not os.path.exists(config.pred_csv_path):
         raise FileNotFoundError(
-            f"{config.pred_csv_path} not found. Attach predictions first."
+            f"{config.pred_csv_path} not found. The compact dataset is missing "
+            "its detector pose table."
         )
 
     gt_rows = _load_csv(config.gt_csv_path)
