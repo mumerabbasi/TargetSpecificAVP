@@ -8,7 +8,7 @@ import random
 from contextlib import nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
@@ -84,6 +84,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-project", default="ravp-target-pose")
     parser.add_argument("--wandb-run-name", default="")
     parser.add_argument("--no-wandb", action="store_true")
+    parser.add_argument(
+        "--resume-checkpoint",
+        default="",
+        help="Path to an existing checkpoint (typically last.pt) to resume",
+    )
     return parser.parse_args()
 
 
@@ -130,18 +135,48 @@ def main() -> None:
         wandb_enabled=not args.no_wandb,
     )
 
+    resume_checkpoint_path = (
+        Path(args.resume_checkpoint).expanduser().resolve()
+        if args.resume_checkpoint
+        else None
+    )
+    resume_checkpoint: Optional[Dict[str, Any]] = None
+    if resume_checkpoint_path is not None:
+        if not resume_checkpoint_path.exists():
+            raise FileNotFoundError(
+                f"Missing resume checkpoint: {resume_checkpoint_path}"
+            )
+        resume_checkpoint = torch.load(resume_checkpoint_path, map_location="cpu")
+        validate_resume_config(config, resume_checkpoint)
+
     set_random_seed(config.random_seed)
     if hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision("high")
 
     rows = load_pose_rows(config)
     rows_by_split = build_group_splits(rows, config)
-    translation_stats = TranslationStats.from_rows(rows_by_split["train"])
-
-    run_dir = create_run_dir(config)
-    save_json(run_dir / "config.json", config.to_dict())
-    save_json(run_dir / "translation_stats.json", translation_stats.to_dict())
-    save_json(run_dir / "split_summary.json", split_summary(rows_by_split))
+    if resume_checkpoint is not None:
+        translation_stats = load_resume_translation_stats(resume_checkpoint)
+        run_dir = resume_checkpoint_path.parent
+        history = load_json_or_default(run_dir / "history.json", default=[])
+        start_epoch = int(resume_checkpoint["epoch"]) + 1
+        best_selection_score = resolve_best_selection_score(
+            history=history,
+            resume_checkpoint=resume_checkpoint,
+        )
+        print(
+            f"[resume] Loaded checkpoint {resume_checkpoint_path} "
+            f"at epoch={resume_checkpoint['epoch']}"
+        )
+    else:
+        translation_stats = TranslationStats.from_rows(rows_by_split["train"])
+        run_dir = create_run_dir(config)
+        save_json(run_dir / "config.json", config.to_dict())
+        save_json(run_dir / "translation_stats.json", translation_stats.to_dict())
+        save_json(run_dir / "split_summary.json", split_summary(rows_by_split))
+        history = []
+        start_epoch = 1
+        best_selection_score = float("inf")
 
     train_dataset = TargetPoseDataset(
         config=config,
@@ -201,6 +236,22 @@ def main() -> None:
         enabled=(config.use_amp and device.type == "cuda"),
     )
 
+    if resume_checkpoint is not None:
+        model.load_state_dict(resume_checkpoint["model_state"])
+
+        optimizer_state = resume_checkpoint.get("optimizer_state")
+        if optimizer_state is not None:
+            optimizer.load_state_dict(optimizer_state)
+            move_optimizer_state_to_device(optimizer, device)
+
+        scheduler_state = resume_checkpoint.get("scheduler_state")
+        if scheduler_state is not None:
+            scheduler.load_state_dict(scheduler_state)
+
+        scaler_state = resume_checkpoint.get("scaler_state")
+        if scaler_state is not None and scaler is not None and scaler.is_enabled():
+            scaler.load_state_dict(scaler_state)
+
     wandb_run = init_wandb(
         config=config,
         run_dir=run_dir,
@@ -210,9 +261,13 @@ def main() -> None:
         model=model,
     )
 
-    best_selection_score = float("inf")
-    history = []
-    for epoch in range(1, config.num_epochs + 1):
+    if start_epoch > config.num_epochs:
+        print(
+            f"[resume] Checkpoint is already at epoch {start_epoch - 1}, "
+            f"which is >= num_epochs={config.num_epochs}. Skipping train loop."
+        )
+
+    for epoch in range(start_epoch, config.num_epochs + 1):
         train_stats = run_epoch(
             model=model,
             loader=train_loader,
@@ -542,6 +597,88 @@ def save_json(path: Path, payload: object) -> None:
     with path.open("w") as handle:
         json.dump(payload, handle, indent=2)
         handle.write("\n")
+
+
+def load_json_or_default(path: Path, default: object) -> object:
+    """Load JSON when available, otherwise return the caller's default."""
+    if not path.exists():
+        return default
+    with path.open("r") as handle:
+        return json.load(handle)
+
+
+def load_resume_translation_stats(
+    resume_checkpoint: Dict[str, Any],
+) -> TranslationStats:
+    """Load translation normalization stats from a resume checkpoint."""
+    payload = resume_checkpoint.get("translation_stats")
+    if payload is None:
+        raise KeyError("Resume checkpoint is missing translation_stats")
+    if not isinstance(payload, dict):
+        raise TypeError("translation_stats in checkpoint must be a dictionary")
+    return TranslationStats.from_dict(payload)
+
+
+def resolve_best_selection_score(
+    history: object,
+    resume_checkpoint: Dict[str, Any],
+) -> float:
+    """Resolve the best validation score observed so far when resuming."""
+    scores = []
+    if isinstance(history, list):
+        for item in history:
+            if not isinstance(item, dict):
+                continue
+            val_stats = item.get("val")
+            if isinstance(val_stats, dict) and "selection_score" in val_stats:
+                scores.append(float(val_stats["selection_score"]))
+    if scores:
+        return min(scores)
+
+    val_stats = resume_checkpoint.get("val_stats")
+    if isinstance(val_stats, dict) and "selection_score" in val_stats:
+        return float(val_stats["selection_score"])
+    return float("inf")
+
+
+def validate_resume_config(
+    config: TargetPoseTrainingConfig,
+    resume_checkpoint: Dict[str, Any],
+) -> None:
+    """Guard against accidental mismatches when resuming checkpoints."""
+    checkpoint_config = resume_checkpoint.get("config")
+    if not isinstance(checkpoint_config, dict):
+        return
+
+    checkpoint_label = checkpoint_config.get("label_source")
+    if checkpoint_label is not None and checkpoint_label != config.label_source:
+        raise ValueError(
+            "Resume checkpoint label_source mismatch: "
+            f"checkpoint={checkpoint_label}, cli={config.label_source}"
+        )
+
+    checkpoint_root = checkpoint_config.get("dataset_root")
+    if checkpoint_root is None:
+        return
+
+    checkpoint_root_path = Path(str(checkpoint_root)).expanduser().resolve()
+    config_root_path = Path(config.dataset_root).expanduser().resolve()
+    if checkpoint_root_path != config_root_path:
+        raise ValueError(
+            "Resume checkpoint dataset_root mismatch: "
+            f"checkpoint={checkpoint_root_path}, cli={config_root_path}"
+        )
+
+
+def move_optimizer_state_to_device(
+    optimizer: AdamW,
+    device: torch.device,
+) -> None:
+    """Move optimizer tensors to the selected device after state restoration."""
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(device=device, non_blocking=True)
 
 
 def select_device(device_name: str) -> torch.device:
