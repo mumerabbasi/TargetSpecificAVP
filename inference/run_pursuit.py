@@ -45,6 +45,17 @@ def _save_spectator_frame(
     return frame_path
 
 
+def _save_ego_frame(
+    config: InferenceConfig,
+    frame_idx: int,
+    image: np.ndarray,
+) -> str:
+    _ensure_dir(config.ego_frames_dir)
+    frame_path = os.path.join(config.ego_frames_dir, f"frame_{frame_idx:06d}.png")
+    cv2.imwrite(frame_path, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+    return frame_path
+
+
 def _save_ego_debug_frame(
     config: InferenceConfig,
     frame_idx: int,
@@ -57,7 +68,8 @@ def _save_ego_debug_frame(
     if not bool(config.save_debug_images):
         return None
 
-    _ensure_dir(config.ego_frames_dir)
+    debug_frames_dir = os.path.join(config.debug_dir, "ego_debug_frames")
+    _ensure_dir(debug_frames_dir)
     frame = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
 
     if target_mask is not None and np.any(target_mask):
@@ -101,7 +113,7 @@ def _save_ego_debug_frame(
         (255, 255, 255),
     )
 
-    path = os.path.join(config.ego_frames_dir, f"frame_{frame_idx:06d}.png")
+    path = os.path.join(debug_frames_dir, f"frame_{frame_idx:06d}.png")
     cv2.imwrite(path, frame)
     return path
 
@@ -374,6 +386,7 @@ def run_pursuit(config: InferenceConfig) -> str:
                 control.steer,
                 control.brake,
             )
+            _save_ego_frame(config, frame_idx, packet.rgb_image)
             _save_spectator_frame(config, frame_idx, packet.spectator_image)
             _save_ego_debug_frame(
                 config,
@@ -418,10 +431,8 @@ def run_pursuit(config: InferenceConfig) -> str:
     fps = 10.0
     if float(config.fixed_delta_seconds) > 1e-6:
         fps = 1.0 / float(config.fixed_delta_seconds)
-    ego_video_path = None
+    ego_video_path = _build_video(config.ego_frames_dir, config.ego_video_path, fps)
     spectator_video_path = None
-    if bool(config.save_debug_images):
-        ego_video_path = _build_video(config.ego_frames_dir, config.ego_video_path, fps)
     if bool(config.enable_spectator_camera):
         spectator_video_path = _build_video(
             config.spectator_frames_dir,

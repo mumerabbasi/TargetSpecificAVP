@@ -1,0 +1,240 @@
+{
+  "config": {
+    "checkpoint_path": "/my_workspace/Resume/RAVP/target_pose_runs/target_pose_regressor_pred_20260410_223807/best.pt",
+    "output_dir": "/my_workspace/Resume/RAVP/inference_output",
+    "run_name": "20260411_173834_Town02",
+    "carla_host": "localhost",
+    "carla_port": 2150,
+    "tm_port": 8000,
+    "client_timeout_s": 60.0,
+    "town": "Town02",
+    "random_seed": 7,
+    "sync_mode": true,
+    "fixed_delta_seconds": 0.1,
+    "num_frames": 300,
+    "warmup_ticks": 25,
+    "clear_existing_vehicles": true,
+    "num_background_vehicles": 20,
+    "initial_target_distance_m": 12.0,
+    "ego_initial_speed_mps": 0.0,
+    "target_speed_difference_pct": 80.0,
+    "background_speed_difference_pct": 15.0,
+    "traffic_follow_distance_m": 2.5,
+    "spawn_attempts": 30,
+    "background_spawn_exclusion_radius_m": 15.0,
+    "target_spawn_z_offset_m": 0.3,
+    "require_follow_friendly_spawn": true,
+    "follow_spawn_lookahead_m": 45.0,
+    "follow_spawn_step_m": 5.0,
+    "follow_spawn_max_yaw_delta_deg": 12.0,
+    "image_width": 1024,
+    "image_height": 1024,
+    "fov": 90.0,
+    "camera_x_m": 1.5,
+    "camera_y_m": 0.0,
+    "camera_z_m": 1.6,
+    "desired_distance_m": 8.0,
+    "collision_distance_m": 4.0,
+    "slowdown_distance_m": 7.0,
+    "wheelbase_m": 2.87,
+    "mpc_horizon": 25,
+    "mpc_dt": 0.1,
+    "max_throttle": 0.8,
+    "max_brake": 0.8,
+    "max_steer": 0.7,
+    "max_steer_rad": 0.5,
+    "max_accel": 3.0,
+    "max_decel": -6.0,
+    "launch_throttle_floor": 0.22,
+    "launch_speed_threshold_mps": 2.0,
+    "steer_filter_alpha": 0.9,
+    "w_dist": 8.0,
+    "w_lat": 18.0,
+    "w_yaw": 3.0,
+    "w_vel": 1.0,
+    "w_accel": 1.5,
+    "w_steer": 10.0,
+    "w_daccel": 10.0,
+    "w_dsteer": 200.0,
+    "follow_band_distance_abs_m": 2.0,
+    "follow_band_lateral_abs_m": 1.5,
+    "follow_band_yaw_abs_deg": 20.0,
+    "max_pose_hold_frames": 12,
+    "target_out_of_view_breach_frames": 20,
+    "ego_offroad_breach_frames": 15,
+    "lost_distance_m": 30.0,
+    "lost_ego_stationary_speed_mps": 0.3,
+    "lost_target_speed_mps": 1.0,
+    "lost_patience_frames": 3,
+    "bootstrap_with_projected_bbox": true,
+    "bootstrap_bbox_xyxy": null,
+    "enable_bbox_reseed": true,
+    "prompt_bbox_pad_px": 24,
+    "sam3_repo_path": "/my_workspace/4DHHOI/sam3",
+    "sam3_checkpoint_path": "",
+    "sam3_device": "cuda:0",
+    "pose_device": "cuda:0",
+    "enable_spectator_camera": true,
+    "spectator_width": 1024,
+    "spectator_height": 1024,
+    "spectator_fov": 110.0,
+    "spectator_x_m": 0.0,
+    "spectator_y_m": 0.0,
+    "spectator_z_m": 24.0,
+    "spectator_pitch_deg": -90.0,
+    "spectator_yaw_deg": 0.0,
+    "spectator_roll_deg": 0.0,
+    "save_debug_images": false,
+    "save_tracking_masks": false
+  },
+  "frames": 88,
+  "completion_reason": "ego_lost_target",
+  "completion_ratio": 0.29333333333333333,
+  "completion_percent": 29.333333333333332,
+  "pose_metrics": {
+    "availability_ratio": 1.0,
+    "fresh_ratio": 1.0,
+    "stale_ratio": 0.0,
+    "all_pose_frames": {
+      "frames": 88,
+      "dx_abs_m": {
+        "mean": 1.6210597322838731,
+        "median": 0.9386030367455005,
+        "p90": 2.5882694767773877,
+        "max": 14.275693466583954
+      },
+      "dy_abs_m": {
+        "mean": 0.5196560042774965,
+        "median": 0.428333357146499,
+        "p90": 0.9663814561656469,
+        "max": 2.3379593031005648
+      },
+      "follow_yaw_abs_deg": {
+        "mean": 3.6552038255348718,
+        "median": 2.908725712681189,
+        "p90": 9.01577889919281,
+        "max": 13.228522412478924
+      },
+      "mask_iou": {
+        "mean": 0.9676448214265527,
+        "median": 0.9706614602739797,
+        "p90": 0.9810569132209707,
+        "max": 0.9843805257573971
+      },
+      "latency_ms": {
+        "mean": 126.12976811148904,
+        "median": 127.44545936584473,
+        "p90": 130.31835556030273,
+        "max": 158.95390510559082
+      }
+    },
+    "fresh_pose_frames": {
+      "frames": 88,
+      "dx_abs_m": {
+        "mean": 1.6210597322838731,
+        "median": 0.9386030367455005,
+        "p90": 2.5882694767773877,
+        "max": 14.275693466583954
+      },
+      "dy_abs_m": {
+        "mean": 0.5196560042774965,
+        "median": 0.428333357146499,
+        "p90": 0.9663814561656469,
+        "max": 2.3379593031005648
+      },
+      "follow_yaw_abs_deg": {
+        "mean": 3.6552038255348718,
+        "median": 2.908725712681189,
+        "p90": 9.01577889919281,
+        "max": 13.228522412478924
+      },
+      "mask_iou": {
+        "mean": 0.9676448214265527,
+        "median": 0.9706614602739797,
+        "p90": 0.9810569132209707,
+        "max": 0.9843805257573971
+      },
+      "latency_ms": {
+        "mean": 126.12976811148904,
+        "median": 127.44545936584473,
+        "p90": 130.31835556030273,
+        "max": 158.95390510559082
+      }
+    }
+  },
+  "pursuit_metrics": {
+    "distance_error_abs_m": {
+      "mean": 1.7038041204894727,
+      "median": 1.172541007152264,
+      "p90": 4.00591187597252,
+      "max": 4.466327231662538
+    },
+    "distance_error_signed_m": {
+      "mean": 0.8175965087126645,
+      "median": -0.1360792999577911,
+      "p90": 4.00591187597252,
+      "max": 4.466327231662538
+    },
+    "lateral_error_abs_m": {
+      "mean": 0.7357521419501466,
+      "median": 0.6854467353338576,
+      "p90": 1.5427726718750474,
+      "max": 1.8528143126780945
+    },
+    "follow_yaw_abs_deg": {
+      "mean": 4.299709074024577,
+      "median": 4.038540244102478,
+      "p90": 9.592869658023119,
+      "max": 10.964921936392784
+    },
+    "within_follow_band_ratio": 0.5681818181818182,
+    "offroad_ratio": 0.0,
+    "ego_speed_mps": {
+      "mean": 1.6285553256649536,
+      "median": 1.7634073245807613,
+      "p90": 2.7054910241930754,
+      "max": 3.343261266781043
+    },
+    "target_speed_mps": {
+      "mean": 1.0301234882477655,
+      "median": 1.1206803206262292,
+      "p90": 1.8718561878379016,
+      "max": 2.0490661536958923
+    },
+    "command_delta_throttle": {
+      "mean": 0.18148235394721765,
+      "median": 0.0,
+      "p90": 0.6110401450210223,
+      "max": 0.8
+    },
+    "command_delta_steer": {
+      "mean": 0.05219506569677957,
+      "median": 0.04458269533940329,
+      "p90": 0.10249286664434286,
+      "max": 0.12896043384271885
+    },
+    "command_delta_brake": {
+      "mean": 0.049707541205362284,
+      "median": 0.0,
+      "p90": 0.18845026204693102,
+      "max": 0.6281654290579654
+    }
+  },
+  "closed_loop_metrics": {
+    "completion_ratio": 0.29333333333333333,
+    "completion_percent": 29.333333333333332,
+    "target_lane_invasions": 0,
+    "ego_lane_invasions": 0,
+    "target_collisions": 0,
+    "ego_collisions": 0,
+    "relative_infraction": 1.0,
+    "absolute_infraction": 1.0,
+    "control_difference": 0.540557213746904,
+    "ate": 0.33271893295861926,
+    "matched_frames": 20
+  },
+  "artifacts": {
+    "ego_video_path": null,
+    "spectator_video_path": "/my_workspace/Resume/RAVP/inference_output/20260411_173834_Town02/spectator.mp4"
+  }
+}

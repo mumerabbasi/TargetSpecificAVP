@@ -1,0 +1,12 @@
+Town: Town02
+Completion_Reason: ego_lost_target
+Completion_Percent: 29.33
+Target_Lane_Invasions: 0
+Ego_Lane_Invasions: 0
+Target_Collisions: 0
+Ego_Collisions: 0
+Relative_Infraction: 1.0000
+Absolute_Infraction: 1.0000
+Control_Difference: 0.5406
+ATE: 0.3327
+Matched_Frames: 20
