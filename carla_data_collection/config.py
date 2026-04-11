@@ -1,155 +1,190 @@
-"""Configuration for CARLA data collection."""
+"""Configuration for the single-pass CARLA dataset pipeline."""
+
+from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Tuple
+from typing import Sequence, Tuple
+
+
+DEFAULT_TOWNS: Tuple[str, ...] = (
+    "Town01",
+    "Town01_Opt",
+    "Town02",
+    "Town02_Opt",
+    "Town03",
+    "Town03_Opt",
+    "Town04",
+    "Town04_Opt",
+    "Town05",
+    "Town05_Opt",
+)
 
 
 @dataclass
 class Config:
-    """Configuration for CARLA 3D detection dataset collection."""
+    """Shared configuration for collection and reporting.
 
-    # ---------------------------------------------------------------------------
-    # Model paths
-    # ---------------------------------------------------------------------------
-    model_dir: str = "mmdet3d_models"
+    The dataset is built in one pass:
 
-    # CenterPoint config
-    centerpoint_config: str = field(default="")
-    centerpoint_checkpoint: str = field(default="")
+    1. capture synchronized CARLA sensors in memory,
+    2. run SAM3 and the 3D detector immediately,
+    3. write only final RGB, masks, CSVs, and a frame manifest.
+    """
 
-    # YOLO model
-    yolo_model: str = "/usr/prakt/s0050/ravp/sam2/yolo11x.pt"
-
-    # SAM2 model
-    sam2_path: str = "/usr/prakt/s0050/ravp/sam2"
-    sam2_checkpoint: str = ""
-    sam2_config: str = "configs/sam2.1/sam2.1_hiera_s.yaml"
-
-    # ---------------------------------------------------------------------------
-    # Detection thresholds
-    # ---------------------------------------------------------------------------
-    score_thr: float = 0.15  # CenterPoint score threshold
-    yolo_conf: float = 0.5   # YOLO confidence threshold
-
-    # ---------------------------------------------------------------------------
-    # Outlier filtering thresholds
-    # ---------------------------------------------------------------------------
-    max_err_dx: float = 0.5   # meters
-    max_err_dy: float = 0.5   # meters
-    max_err_yaw: float = 5.0  # degrees
-
-    # ---------------------------------------------------------------------------
-    # Output
-    # ---------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Output layout
+    # ------------------------------------------------------------------
     output_dir: str = "carla_dataset"
-    fresh_start: bool = False  # If True, overwrite existing data instead of resuming
+    fresh_start: bool = False
 
-    # ---------------------------------------------------------------------------
+    rgb_subdir: str = "rgb"
+    masks_subdir: str = "masks"
+    gt_csv_name: str = "gt_poses.csv"
+    pred_csv_name: str = "pred_poses.csv"
+    frames_manifest_name: str = "frames.jsonl"
+    collection_summary_name: str = "collection_summary.json"
+    metrics_report_name: str = "detailed_metrics.json"
+
+    # ------------------------------------------------------------------
     # CARLA connection
-    # ---------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     carla_host: str = "localhost"
     carla_port: int = 2150
+    tm_port: int = 8000
+    client_timeout_s: float = 120.0
 
-    # ---------------------------------------------------------------------------
-    # Dataset collection parameters
-    # ---------------------------------------------------------------------------
-    # List of CARLA towns to collect from
-    towns: tuple = ("Town01", "Town02", "Town03", "Town04", "Town05")
-    frames_per_town: int = 100  # Number of frames to collect per town
-    min_targets: int = 1
-    max_targets: int = 5
+    # ------------------------------------------------------------------
+    # Collection settings
+    # ------------------------------------------------------------------
+    towns: Tuple[str, ...] = DEFAULT_TOWNS
+    target_samples_per_town: int = 3000
+    max_frames_per_town: int = 12000
+    max_episodes_per_town: int = 4
+    episode_frame_budget: int = 3000
+    warmup_ticks: int = 80
 
-    # Derived parameters (computed automatically)
-    num_waypoints: int = 0  # Will be computed from frames_per_town
-    frames_per_waypoint: int = 1  # Keep at 1 for diversity
+    num_traffic_vehicles: int = 80
+    traffic_mode: str = "traffic_manager"
+    follow_only: bool = False
+    min_follow_actors_per_frame: int = 1
+    max_follow_actors_per_frame: int = 0
+    follow_lateral_limit_m: float = 12.0
+    follow_yaw_limit_deg: float = 120.0
+    background_speed_difference_pct: float = 20.0
+    ego_speed_difference_pct: float = 5.0
+    traffic_follow_distance_m: float = 2.5
+    constant_velocity_ego_speed_mps: float = 8.0
+    constant_velocity_background_min_speed_mps: float = 5.0
+    constant_velocity_background_max_speed_mps: float = 10.0
+    nearby_vehicle_radius_m: float = 90.0
 
-    # ---------------------------------------------------------------------------
-    # Target spawn Gaussian distribution parameters
-    # ---------------------------------------------------------------------------
-    # dx: longitudinal distance (ahead of ego)
-    target_dx_mean: float = 10.0
-    target_dx_std: float = 3.0
-    target_dx_min: float = 4.0
-    target_dx_max: float = 20.0
+    sync_mode: bool = True
+    fixed_delta_seconds: float = 0.05
 
-    # dy: lateral offset (0 = same lane)
-    target_dy_mean: float = 0.0
-    target_dy_std: float = 2.0
-    target_dy_min: float = -5.0
-    target_dy_max: float = 5.0
-
-    # dyaw: relative yaw (0 = same heading as ego)
-    target_dyaw_mean: float = 0.0
-    target_dyaw_std: float = 20.0
-    target_dyaw_min: float = -70.0
-    target_dyaw_max: float = 70.0
-
-    # ---------------------------------------------------------------------------
-    # Ego spawn Gaussian yaw offset (for scene diversity)
-    # ---------------------------------------------------------------------------
-    ego_dyaw_mean: float = 0.0
-    ego_dyaw_std: float = 5.0
-    ego_dyaw_min: float = -15.0
-    ego_dyaw_max: float = 15.0
-
-    # ---------------------------------------------------------------------------
-    # Camera settings
-    # ---------------------------------------------------------------------------
-    image_width: int = 1024
-    image_height: int = 1024
+    # ------------------------------------------------------------------
+    # Sensor settings
+    # ------------------------------------------------------------------
+    image_width: int = 768
+    image_height: int = 768
     fov: float = 90.0
-
-    # LiDAR height offset
     lidar_z_offset: float = 1.73
+    rgb_jpeg_quality: int = 95
+
+    # ------------------------------------------------------------------
+    # Capture-time visibility filters
+    # ------------------------------------------------------------------
+    vehicle_semantic_tag: int = 14
+    min_visible_vehicle_pixels: int = 100
+    min_visible_bbox_width: int = 20
+    min_visible_bbox_height: int = 20
+    edge_margin_px: int = 6
+    instance_bbox_dilation_px: int = 4
+
+    # Used to keep long-range samples from being drowned out by near traffic.
+    distance_bins_m: Tuple[float, ...] = (
+        0.0, 5.0, 10.0, 15.0, 20.0, 30.0, 40.0)
+    # ------------------------------------------------------------------
+    # SAM3 mask generation
+    # ------------------------------------------------------------------
+    sam3_repo_path: str = "/my_workspace/4DHHOI/sam3"
+    sam3_checkpoint_path: str = ""
+    sam3_prompt: str = "car"
+    sam3_fallback_prompt: str = "vehicle"
+    sam3_confidence_threshold: float = 0.35
+    sam3_duplicate_iou_thr: float = 0.75
+    sam3_device: str = "cuda:0"
+
+    # ------------------------------------------------------------------
+    # Sample acceptance
+    # ------------------------------------------------------------------
+    min_mask_area_px: int = 120
+    sam3_actor_iou_thr: float = 0.15
+
+    # ------------------------------------------------------------------
+    # 3D detector
+    # ------------------------------------------------------------------
+    model_dir: str = "mmdet3d_models"
+    detector_name: str = "centerpoint"
+    detector_config: str = field(default="")
+    detector_checkpoint: str = field(default="")
+    detector_score_thr: float = 0.15
+    detector_match_dist_m: float = 4.0
+    detector_device: str = "cuda:0"
+
+    # ------------------------------------------------------------------
+    # Reporting
+    # ------------------------------------------------------------------
+    save_reports: bool = True
 
     def __post_init__(self) -> None:
-        """Set derived paths after initialization."""
-        # Compute num_waypoints from frames_per_town
-        # Each waypoint gives 1 frame (frames_per_waypoint=1)
-        if self.num_waypoints == 0:
-            self.num_waypoints = self.frames_per_town
-
-        # CenterPoint paths
-        if not self.centerpoint_config:
-            cfg = "centerpoint_voxel0075_second_secfpn_head-dcn-circlenms"
-            cfg += "_8xb4-cyclic-20e_nus-3d.py"
-            self.centerpoint_config = os.path.join(
-                self.model_dir, "configs/centerpoint", cfg
+        if not self.detector_config:
+            self.detector_config = os.path.join(
+                self.model_dir,
+                "configs/centerpoint/"
+                "centerpoint_voxel0075_second_secfpn_head-dcn-circlenms"
+                "_8xb4-cyclic-20e_nus-3d.py",
             )
 
-        if not self.centerpoint_checkpoint:
-            ckpt = "centerpoint_0075voxel_second_secfpn_dcn_circlenms"
-            ckpt += "_4x8_cyclic_20e_nus_20220810_025930-657f67e0.pth"
-            self.centerpoint_checkpoint = os.path.join(self.model_dir, ckpt)
-
-        # SAM2 checkpoint
-        if not self.sam2_checkpoint:
-            self.sam2_checkpoint = os.path.join(
-                self.sam2_path, "checkpoints/sam2.1_hiera_small.pt"
+        if not self.detector_checkpoint:
+            self.detector_checkpoint = os.path.join(
+                self.model_dir,
+                "centerpoint_0075voxel_second_secfpn_dcn_circlenms"
+                "_4x8_cyclic_20e_nus_20220810_025930-657f67e0.pth",
             )
 
     @property
-    def csv_output(self) -> str:
-        """Path to output CSV file."""
-        return os.path.join(self.output_dir, "poses.csv")
+    def rgb_dir(self) -> str:
+        return os.path.join(self.output_dir, self.rgb_subdir)
 
     @property
-    def dx_range(self) -> Tuple[float, float]:
-        """Range for dx clipping."""
-        return (self.target_dx_min, self.target_dx_max)
+    def masks_dir(self) -> str:
+        return os.path.join(self.output_dir, self.masks_subdir)
 
     @property
-    def dy_range(self) -> Tuple[float, float]:
-        """Range for dy clipping."""
-        return (self.target_dy_min, self.target_dy_max)
+    def gt_csv_path(self) -> str:
+        return os.path.join(self.output_dir, self.gt_csv_name)
 
     @property
-    def dyaw_range(self) -> Tuple[float, float]:
-        """Range for dyaw clipping."""
-        return (self.target_dyaw_min, self.target_dyaw_max)
+    def pred_csv_path(self) -> str:
+        return os.path.join(self.output_dir, self.pred_csv_name)
 
     @property
-    def ego_dyaw_range(self) -> Tuple[float, float]:
-        """Range for ego dyaw clipping."""
-        return (self.ego_dyaw_min, self.ego_dyaw_max)
+    def frames_manifest_path(self) -> str:
+        return os.path.join(self.output_dir, self.frames_manifest_name)
+
+    @property
+    def collection_summary_path(self) -> str:
+        return os.path.join(self.output_dir, self.collection_summary_name)
+
+    @property
+    def metrics_report_path(self) -> str:
+        return os.path.join(self.output_dir, self.metrics_report_name)
+
+    @property
+    def dataset_dirs(self) -> Sequence[str]:
+        return (
+            self.output_dir,
+            self.rgb_dir,
+            self.masks_dir,
+        )

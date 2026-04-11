@@ -1,0 +1,17 @@
+{
+  "train": {
+    "rows": 87630,
+    "frames": 62841,
+    "groups": 50
+  },
+  "val": {
+    "rows": 9309,
+    "frames": 7842,
+    "groups": 10
+  },
+  "test": {
+    "rows": 19031,
+    "frames": 15365,
+    "groups": 11
+  }
+}

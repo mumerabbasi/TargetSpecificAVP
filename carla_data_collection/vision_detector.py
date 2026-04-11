@@ -1,117 +1,118 @@
-"""Vision models: YOLO for detection, SAM2 for segmentation."""
+"""SAM3-based vehicle mask generation for dataset collection."""
+
+from __future__ import annotations
 
 import sys
 from typing import Any, Dict, List
 
 import numpy as np
-from ultralytics import YOLO
+from PIL import Image
+
+from .utils import binary_mask_to_bbox, deduplicate_mask_candidates
 
 
-def _ensure_sam2_path(sam2_path: str) -> None:
-    """Add SAM2 to Python path if not already present."""
-    if sam2_path not in sys.path:
-        sys.path.insert(0, sam2_path)
+def _ensure_repo_on_path(repo_path: str) -> None:
+    if repo_path and repo_path not in sys.path:
+        sys.path.insert(0, repo_path)
 
 
 class VisionDetector:
-    """YOLO + SAM2 based car detection and segmentation."""
+    """Generate per-vehicle masks from an RGB frame using SAM3."""
 
     def __init__(
         self,
-        yolo_path: str,
-        sam2_checkpoint: str,
-        sam2_config: str,
-        sam2_path: str = "/usr/prakt/s0050/ravp/sam2",
-        device: str = "cuda",
+        repo_path: str,
+        checkpoint_path: str = "",
+        prompt: str = "car",
+        fallback_prompt: str = "vehicle",
+        confidence_threshold: float = 0.35,
+        duplicate_iou_thr: float = 0.75,
+        device: str = "cuda:0",
     ) -> None:
-        """
-        Initialize YOLO and SAM2 models.
+        _ensure_repo_on_path(repo_path)
+        try:
+            from sam3.model.sam3_image_processor import Sam3Processor
+            from sam3.model_builder import build_sam3_image_model
+        except ImportError as exc:
+            raise ImportError(
+                "sam3 must be importable in the dataset collection "
+                "environment."
+            ) from exc
 
-        Args:
-            yolo_path: Path to YOLO weights.
-            sam2_checkpoint: Path to SAM2 checkpoint.
-            sam2_config: SAM2 config name.
-            sam2_path: Path to SAM2 repository.
-            device: Device for inference.
-        """
-        print("Loading YOLO model...")
-        self.yolo = YOLO(yolo_path)
+        print("Loading SAM3 image model...")
+        model = build_sam3_image_model(
+            checkpoint_path=checkpoint_path or None,
+            load_from_HF=not bool(checkpoint_path),
+            device=device,
+        )
+        model = model.to(device)
+        model.eval()
+        self.processor = Sam3Processor(
+            model,
+            device=device,
+            confidence_threshold=confidence_threshold,
+        )
+        self.prompt = prompt
+        self.fallback_prompt = fallback_prompt
+        self.duplicate_iou_thr = duplicate_iou_thr
 
-        # Import SAM2 (requires path modification)
-        _ensure_sam2_path(sam2_path)
-        from sam2.build_sam import build_sam2  # type: ignore
-        from sam2.sam2_image_predictor import SAM2ImagePredictor  # type: ignore
+    def set_image(self, rgb_image: np.ndarray) -> Dict[str, Any]:
+        """Cache backbone features for an RGB frame."""
+        # Sam3Processor expects PIL images or CHW tensors; passing an HWC numpy
+        # array makes it misread the width as the channel count.
+        pil_image = Image.fromarray(rgb_image.astype(np.uint8), mode="RGB")
+        return self.processor.set_image(pil_image)
 
-        print("Loading SAM2 model...")
-        self.sam2 = build_sam2(sam2_config, sam2_checkpoint, device=device)
-        self.sam2_predictor = SAM2ImagePredictor(self.sam2)
-
-        # COCO class IDs for vehicles
-        self.vehicle_classes = [2, 5, 7]  # car, bus, truck
-
-    def detect_and_segment(
-        self,
-        rgb_image: np.ndarray,
-        conf_threshold: float = 0.5,
-    ) -> List[Dict[str, Any]]:
-        """
-        Detect cars with YOLO and segment each with SAM2.
-
-        Args:
-            rgb_image: HxWx3 RGB image.
-            conf_threshold: YOLO confidence threshold.
-
-        Returns:
-            List of detections, each with:
-                - bbox: [x1, y1, x2, y2] bounding box
-                - mask: HxW binary mask
-                - conf: detection confidence
-                - mask_score: SAM2 mask score
-                - class_id: COCO class ID
-        """
-        # Run YOLO detection
-        results = self.yolo(rgb_image, conf=conf_threshold, verbose=False)
-
-        if len(results) == 0 or results[0].boxes is None:
+    def _results_to_candidates(
+            self, results: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Convert a SAM3 processor state into deduplicated mask candidates."""
+        if len(results["scores"]) == 0:
             return []
 
-        boxes = results[0].boxes
-        detections = []
+        masks = results["masks"].detach().cpu().numpy()
+        boxes = results["boxes"].detach().cpu().numpy()
+        scores = results["scores"].detach().cpu().numpy()
 
-        # Filter for vehicle classes
-        for i in range(len(boxes)):
-            class_id = int(boxes.cls[i].item())
-            if class_id not in self.vehicle_classes:
+        candidates: List[Dict[str, Any]] = []
+        for mask, box, score in zip(masks, boxes, scores):
+            binary_mask = mask.squeeze(0).astype(bool)
+            bbox = binary_mask_to_bbox(binary_mask)
+            if bbox is None:
                 continue
-
-            bbox = boxes.xyxy[i].cpu().numpy()  # [x1, y1, x2, y2]
-            conf = float(boxes.conf[i].item())
-
-            detections.append({
-                "bbox": bbox,
-                "conf": conf,
-                "class_id": class_id,
-            })
-
-        if not detections:
-            return []
-
-        # Run SAM2 segmentation for each detected car
-        self.sam2_predictor.set_image(rgb_image)
-
-        for det in detections:
-            bbox = det["bbox"]
-
-            # Use bounding box as prompt for SAM2
-            masks, scores, _ = self.sam2_predictor.predict(
-                point_coords=None,
-                point_labels=None,
-                box=bbox[None, :],  # SAM2 expects [1, 4]
-                multimask_output=False,
+            candidates.append(
+                {
+                    "mask": binary_mask,
+                    "bbox": np.asarray(box, dtype=np.float32),
+                    "bbox_from_mask": bbox,
+                    "score": float(score),
+                }
             )
 
-            # Take the best mask
-            det["mask"] = masks[0].astype(bool)  # HxW boolean mask
-            det["mask_score"] = float(scores[0])
+        return deduplicate_mask_candidates(candidates, self.duplicate_iou_thr)
 
-        return detections
+    def segment_from_box(
+        self,
+        state: Dict[str, Any],
+        bbox_xyxy: tuple[int, int, int, int],
+    ) -> List[Dict[str, Any]]:
+        """Return SAM3 masks conditioned on a target-specific 2D box prompt."""
+        img_w = float(state["original_width"])
+        img_h = float(state["original_height"])
+        x1, y1, x2, y2 = bbox_xyxy
+        cx = ((x1 + x2) * 0.5) / img_w
+        cy = ((y1 + y2) * 0.5) / img_h
+        width = max(float(x2 - x1), 1.0) / img_w
+        height = max(float(y2 - y1), 1.0) / img_h
+
+        self.processor.reset_all_prompts(state)
+        if self.prompt:
+            results = self.processor.set_text_prompt(self.prompt, state)
+            if len(results["scores"]) == 0 and self.fallback_prompt:
+                self.processor.reset_all_prompts(state)
+                self.processor.set_text_prompt(self.fallback_prompt, state)
+        results = self.processor.add_geometric_prompt(
+            [cx, cy, width, height],
+            True,
+            state,
+        )
+        return self._results_to_candidates(results)

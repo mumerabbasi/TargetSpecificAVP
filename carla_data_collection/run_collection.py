@@ -1,140 +1,143 @@
 #!/usr/bin/env python3
-"""
-CARLA 3D Detection Dataset Collection
+"""CLI for the single-pass RAVP dataset pipeline."""
 
-Usage:
-    python carla_data_collection/run_collection.py --towns Town01 Town02 --frames_per_town 50
-
-See Config class for all available options.
-"""
+from __future__ import annotations
 
 import argparse
 import os
 import sys
-import warnings
 
-# Add parent directory to path so we can import carla_data_collection
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PARENT_DIR = os.path.dirname(_SCRIPT_DIR)
 if _PARENT_DIR not in sys.path:
     sys.path.insert(0, _PARENT_DIR)
 
-warnings.filterwarnings("ignore")
+from carla_data_collection import DEFAULT_TOWNS, Config  # noqa: E402
 
-from carla_data_collection import Config, run_collection  # noqa: E402
+
+def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--output-dir", type=str, default="carla_dataset")
+    parser.add_argument("--carla-host", type=str, default="localhost")
+    parser.add_argument("--carla-port", type=int, default=2150)
+    parser.add_argument(
+        "--towns",
+        type=str,
+        nargs="+",
+        default=list(DEFAULT_TOWNS),
+    )
+    parser.add_argument("--follow-only", action="store_true")
+    parser.add_argument("--min-follow-actors-per-frame", type=int, default=1)
+    parser.add_argument("--max-follow-actors-per-frame", type=int, default=0)
+    parser.add_argument("--follow-lateral-limit-m", type=float, default=12.0)
+    parser.add_argument("--follow-yaw-limit-deg", type=float, default=120.0)
+    parser.add_argument("--image-width", type=int, default=768)
+    parser.add_argument("--image-height", type=int, default=768)
+    parser.add_argument("--rgb-jpeg-quality", type=int, default=95)
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Collect 3D detection dataset from CARLA"
-    )
+        description="RAVP dataset pipeline")
+    subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # CARLA connection
-    parser.add_argument(
-        "--carla_host", type=str, default="localhost",
-        help="CARLA server host"
+    collect = subparsers.add_parser(
+        "collect-dataset",
+        help="Collect the final per-target dataset in one pass",
     )
-    parser.add_argument(
-        "--carla_port", type=int, default=2150,
-        help="CARLA server port"
+    _add_common_arguments(collect)
+    collect.add_argument("--fresh", action="store_true")
+    collect.add_argument("--target-samples-per-town", type=int, default=3000)
+    collect.add_argument("--max-frames-per-town", type=int, default=12000)
+    collect.add_argument("--num-traffic-vehicles", type=int, default=80)
+    collect.add_argument(
+        "--traffic-mode",
+        type=str,
+        choices=("traffic_manager", "constant_velocity"),
+        default="traffic_manager",
     )
+    collect.add_argument("--max-episodes-per-town", type=int, default=4)
+    collect.add_argument("--episode-frame-budget", type=int, default=3000)
+    collect.add_argument(
+        "--sam3-repo-path",
+        type=str,
+        default="/my_workspace/4DHHOI/sam3")
+    collect.add_argument("--sam3-checkpoint-path", type=str, default="")
+    collect.add_argument("--sam3-device", type=str, default="cuda:0")
+    collect.add_argument("--detector-name", type=str, default="centerpoint")
+    collect.add_argument("--detector-config", type=str, default="")
+    collect.add_argument("--detector-checkpoint", type=str, default="")
+    collect.add_argument("--detector-device", type=str, default="cuda:0")
+    collect.add_argument("--detector-score-thr", type=float, default=0.15)
 
-    # Towns and frames
-    parser.add_argument(
-        "--towns", type=str, nargs="+",
-        default=["Town01", "Town02", "Town03", "Town04", "Town05"],
-        help="List of CARLA towns to collect from"
+    report = subparsers.add_parser(
+        "report-metrics",
+        help="Write a detailed detector-vs-GT report for an existing dataset",
     )
-    parser.add_argument(
-        "--frames_per_town", type=int, default=10000,
-        help="Number of frames to collect per town"
-    )
-
-    # Target spawning
-    parser.add_argument(
-        "--min_targets", type=int, default=1,
-        help="Minimum targets per waypoint"
-    )
-    parser.add_argument(
-        "--max_targets", type=int, default=5,
-        help="Maximum targets per waypoint"
-    )
-
-    # Output
-    parser.add_argument(
-        "--output_dir", type=str, default="/storage/remote/atcremers45/s0050/carla_dataset",
-        help="Output directory"
-    )
-    parser.add_argument(
-        "--fresh", action="store_true",
-        help="Start fresh (overwrite existing data instead of resuming)"
-    )
-
-    # Gaussian distribution parameters
-    parser.add_argument(
-        "--dx_mean", type=float, default=8.0,
-        help="Target dx mean (m)"
-    )
-    parser.add_argument(
-        "--dx_std", type=float, default=3.0,
-        help="Target dx std (m)"
-    )
-    parser.add_argument(
-        "--dy_std", type=float, default=2.0,
-        help="Target dy std (m)"
-    )
-    parser.add_argument(
-        "--dyaw_std", type=float, default=20.0,
-        help="Target dyaw std (deg)"
-    )
-
-    # Outlier thresholds
-    parser.add_argument(
-        "--max_err_dx", type=float, default=0.5,
-        help="Max dx error (m)"
-    )
-    parser.add_argument(
-        "--max_err_dy", type=float, default=0.5,
-        help="Max dy error (m)"
-    )
-    parser.add_argument(
-        "--max_err_yaw", type=float, default=5.0,
-        help="Max yaw error (deg)"
-    )
+    _add_common_arguments(report)
 
     return parser.parse_args()
 
 
+def _namespace_to_config(args: argparse.Namespace) -> Config:
+    kwargs = {
+        "output_dir": args.output_dir,
+        "carla_host": args.carla_host,
+        "carla_port": args.carla_port,
+        "towns": tuple(args.towns),
+        "follow_only": bool(args.follow_only),
+        "min_follow_actors_per_frame": int(args.min_follow_actors_per_frame),
+        "max_follow_actors_per_frame": int(args.max_follow_actors_per_frame),
+        "follow_lateral_limit_m": float(args.follow_lateral_limit_m),
+        "follow_yaw_limit_deg": float(args.follow_yaw_limit_deg),
+        "image_width": int(args.image_width),
+        "image_height": int(args.image_height),
+        "rgb_jpeg_quality": int(args.rgb_jpeg_quality),
+    }
+
+    if args.command == "collect-dataset":
+        kwargs.update(
+            {
+                "fresh_start": bool(args.fresh),
+                "target_samples_per_town": int(args.target_samples_per_town),
+                "max_frames_per_town": int(args.max_frames_per_town),
+                "num_traffic_vehicles": int(args.num_traffic_vehicles),
+                "traffic_mode": str(args.traffic_mode),
+                "max_episodes_per_town": int(args.max_episodes_per_town),
+                "episode_frame_budget": int(args.episode_frame_budget),
+                "sam3_repo_path": str(args.sam3_repo_path),
+                "sam3_checkpoint_path": str(args.sam3_checkpoint_path),
+                "sam3_device": str(args.sam3_device),
+                "detector_name": str(args.detector_name),
+                "detector_device": str(args.detector_device),
+                "detector_score_thr": float(args.detector_score_thr),
+            }
+        )
+        if args.detector_config:
+            kwargs["detector_config"] = str(args.detector_config)
+        if args.detector_checkpoint:
+            kwargs["detector_checkpoint"] = str(args.detector_checkpoint)
+
+    return Config(**kwargs)
+
+
 def main() -> None:
-    """Main entry point."""
     args = parse_args()
+    config = _namespace_to_config(args)
 
-    config = Config(
-        carla_host=args.carla_host,
-        carla_port=args.carla_port,
-        towns=tuple(args.towns),
-        frames_per_town=args.frames_per_town,
-        min_targets=args.min_targets,
-        max_targets=args.max_targets,
-        output_dir=args.output_dir,
-        fresh_start=args.fresh,
-        target_dx_mean=args.dx_mean,
-        target_dx_std=args.dx_std,
-        target_dy_std=args.dy_std,
-        target_dyaw_std=args.dyaw_std,
-        max_err_dx=args.max_err_dx,
-        max_err_dy=args.max_err_dy,
-        max_err_yaw=args.max_err_yaw,
-    )
+    if args.command == "collect-dataset":
+        from carla_data_collection.collector import collect_dataset
 
-    print("Configuration:")
-    print(f"  Towns: {config.towns}")
-    print(f"  Frames per town: {config.frames_per_town}")
-    print(f"  Total expected frames: {len(config.towns) * config.frames_per_town}")
-    print(f"  Output: {config.output_dir}")
+        collect_dataset(config)
+        return
 
-    run_collection(config)
+    if args.command == "report-metrics":
+        from carla_data_collection.report_metrics import write_detailed_metrics_report
+
+        out_path = write_detailed_metrics_report(config)
+        print(f"[report-metrics] wrote {out_path}")
+        return
+
+    raise ValueError(f"Unknown command: {args.command}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,70 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Notebook caches
+.ipynb_checkpoints/
+
+# Test and tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Local environment and editor state
+.env
+.env.*
+.venv/
+venv/
+.vscode/
+.idea/
+
+# Experiment tracking and logs
+wandb/
+logs/
+runs/
+outputs/
+artifacts/
+checkpoints/
+# Ignore all run artifacts, but keep selected per-run JSON files trackable.
+target_pose_runs/*
+!target_pose_runs/*/
+target_pose_runs/*/*
+!target_pose_runs/*/config.json
+!target_pose_runs/*/split_summary.json
+!target_pose_runs/*/translation_stats.json
+debug/
+tmp/
+
+# Model weights and exported runtimes
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.engine
+*.safetensors
+
+# Generated data and serialized artifacts
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.joblib
+*.h5
+*.hdf5
+dataset/
+datasets/
+RAVP_Dataset*/
+
+# Generated media
+videos/
+recordings/
+spectator_frames/
+*.avi
+*.mov
+

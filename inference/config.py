@@ -1,182 +1,176 @@
-"""Configuration for inference and vehicle pursuit."""
+"""Configuration for target-specific pursuit inference."""
 
-from dataclasses import dataclass
-from typing import Tuple
+from __future__ import annotations
+
 import json
 import os
+from dataclasses import asdict, dataclass
+from typing import Optional, Tuple
+
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 @dataclass
 class InferenceConfig:
-    """Configuration for pose estimation inference and MPC pursuit.
+    """Runtime configuration for CNN-based target pursuit."""
 
-    Attributes:
-        Paths and model settings for inference.
-        CARLA connection and camera settings.
-        MPC controller parameters.
-    """
+    checkpoint_path: str = ""
+    output_dir: str = os.path.join(_REPO_ROOT, "inference_output")
+    run_name: str = ""
 
-    # -------------------------------------------------------------------------
-    # Model paths
-    # -------------------------------------------------------------------------
-    checkpoint_path: str = (
-        "/usr/prakt/s0050/ravp/pose_estimation_runs/"
-        "pose_estimation_20251129_220737/best_model.pth"
-    )
-    config_path: str = (
-        "/usr/prakt/s0050/ravp/pose_estimation_runs/"
-        "pose_estimation_20251129_220737/config.json"
-    )
-
-    # -------------------------------------------------------------------------
-    # CARLA connection
-    # -------------------------------------------------------------------------
+    # CARLA runtime
     carla_host: str = "localhost"
     carla_port: int = 2150
+    tm_port: int = 8000
+    client_timeout_s: float = 60.0
+    town: str = "Town02"
+    random_seed: int = 7
+    sync_mode: bool = True
+    fixed_delta_seconds: float = 0.1
+    num_frames: int = 300
+    warmup_ticks: int = 25
+    clear_existing_vehicles: bool = True
 
-    # -------------------------------------------------------------------------
-    # Camera settings (must match training)
-    # -------------------------------------------------------------------------
+    # Scenario setup
+    num_background_vehicles: int = 20
+    initial_target_distance_m: float = 12.0
+    ego_initial_speed_mps: float = 0.0
+    target_speed_difference_pct: float = 80.0
+    background_speed_difference_pct: float = 15.0
+    traffic_follow_distance_m: float = 2.5
+    spawn_attempts: int = 30
+    background_spawn_exclusion_radius_m: float = 15.0
+    target_spawn_z_offset_m: float = 0.3
+    require_follow_friendly_spawn: bool = True
+    follow_spawn_lookahead_m: float = 45.0
+    follow_spawn_step_m: float = 5.0
+    follow_spawn_max_yaw_delta_deg: float = 12.0
+
+    # Ego cameras
     image_width: int = 1024
     image_height: int = 1024
     fov: float = 90.0
+    camera_x_m: float = 1.5
+    camera_y_m: float = 0.0
+    camera_z_m: float = 1.6
 
-    # -------------------------------------------------------------------------
-    # Model input settings (loaded from config.json)
-    # -------------------------------------------------------------------------
-    model_image_size: Tuple[int, int] = (224, 224)
-    backbone: str = "resnet50"
-    bbox_mode: str = "mask"
-
-    # Pose normalization (loaded from config.json)
-    pose_mean: Tuple[float, float, float, float] = (8.0, 0.0, -0.95, 0.0)
-    pose_std: Tuple[float, float, float, float] = (2.5, 1.7, 0.1, 25.0)
-
-    # Which outputs are predicted
-    predict_dx: bool = True
-    predict_dy: bool = True
-    predict_dz: bool = False
-    predict_yaw: bool = True
-
-    # -------------------------------------------------------------------------
-    # Scenario settings
-    # -------------------------------------------------------------------------
-    town: str = "Town04"
-    num_target_vehicles: int = 3
-    initial_target_distance: float = 6.0  # meters ahead
-
-    # -------------------------------------------------------------------------
-    # MPC controller parameters
-    # -------------------------------------------------------------------------
-    # Prediction horizon
-    mpc_horizon: int = 30  # Number of steps to predict
-    mpc_dt: float = 0.1  # Time step for MPC prediction (seconds)
-
-    # Vehicle parameters
-    wheelbase: float = 2.87  # Distance between axles (meters)
-
-    # Target following parameters
-    desired_distance: float = 4.0  # meters behind target
-    desired_lateral_offset: float = 0.0  # meters (0 = same lane)
-
-    # -------------------------------------------------------------------------
-    # MPC constraints (physical limits)
-    # -------------------------------------------------------------------------
+    # MPC
+    desired_distance_m: float = 8.0
+    collision_distance_m: float = 4.0
+    slowdown_distance_m: float = 7.0
+    wheelbase_m: float = 2.87
+    mpc_horizon: int = 25
+    mpc_dt: float = 0.1
     max_throttle: float = 0.8
     max_brake: float = 0.8
-    max_steer: float = 0.7  # CARLA steering limit [-1, 1]
-    max_steer_rad: float = 0.5  # Max steering angle in radians (~28 deg)
-    max_accel: float = 3.0  # m/s^2
-    max_decel: float = -6.0  # m/s^2
-    max_speed: float = 30.0  # m/s (~108 km/h)
-
-    # -------------------------------------------------------------------------
-    # MPC cost weights (tune these for behavior)
-    # -------------------------------------------------------------------------
-    # Tracking weights
-    w_dist: float = 8.0  # Longitudinal distance error
-    w_lat: float = 15.0  # Lateral offset error
-    w_yaw: float = 3.0  # Heading error
-    w_vel: float = 1.0  # Velocity matching error
-
-    # Control effort weights
-    w_accel: float = 1.5  # Penalize acceleration magnitude
-    w_steer: float = 10.0  # Penalize steering magnitude
-
-    # Smoothness weights (penalize control changes)
-    w_daccel: float = 10.0  # Smooth acceleration changes
-    w_dsteer: float = 200.0  # Smooth steering changes (HIGH for stability)
-
-    # Low-pass filter for steering (0 = no filter, 1 = full filter)
+    max_steer: float = 0.7
+    max_steer_rad: float = 0.5
+    max_accel: float = 3.0
+    max_decel: float = -6.0
+    launch_throttle_floor: float = 0.22
+    launch_speed_threshold_mps: float = 2.0
     steer_filter_alpha: float = 0.9
+    w_dist: float = 8.0
+    w_lat: float = 18.0
+    w_yaw: float = 3.0
+    w_vel: float = 1.0
+    w_accel: float = 1.5
+    w_steer: float = 10.0
+    w_daccel: float = 10.0
+    w_dsteer: float = 200.0
 
-    # -------------------------------------------------------------------------
-    # Safety parameters
-    # -------------------------------------------------------------------------
-    collision_distance: float = 0  # Emergency brake if closer
-    slowdown_distance: float = 0  # Start slowing if closer
+    # Pursuit evaluation thresholds
+    follow_band_distance_abs_m: float = 2.0
+    follow_band_lateral_abs_m: float = 1.5
+    follow_band_yaw_abs_deg: float = 20.0
+    max_pose_hold_frames: int = 12
+    target_out_of_view_breach_frames: int = 20
+    ego_offroad_breach_frames: int = 15
+    lost_distance_m: float = 30.0
+    lost_ego_stationary_speed_mps: float = 0.3
+    lost_target_speed_mps: float = 1.0
+    lost_patience_frames: int = 3
 
-    # -------------------------------------------------------------------------
-    # Simulation settings
-    # -------------------------------------------------------------------------
-    sync_mode: bool = True
-    fixed_delta_seconds: float = 0.1  # 10 FPS
-    num_frames: int = 1000  # Number of frames to run
+    # Tracker / pose model
+    bootstrap_with_projected_bbox: bool = True
+    bootstrap_bbox_xyxy: Optional[Tuple[int, int, int, int]] = None
+    enable_bbox_reseed: bool = True
+    prompt_bbox_pad_px: int = 24
+    sam3_repo_path: str = "/my_workspace/4DHHOI/sam3"
+    sam3_checkpoint_path: str = ""
+    sam3_device: str = "cuda:0"
+    pose_device: str = "cuda:0"
 
-    # -------------------------------------------------------------------------
-    # Visualization
-    # -------------------------------------------------------------------------
-    show_debug_info: bool = True
-    save_video: bool = False
-    video_output_dir: str = "inference_output"
+    # Output / debugging
+    enable_spectator_camera: bool = True
+    spectator_width: int = 1024
+    spectator_height: int = 1024
+    spectator_fov: float = 110.0
+    spectator_x_m: float = 0.0
+    spectator_y_m: float = 0.0
+    spectator_z_m: float = 24.0
+    spectator_pitch_deg: float = -90.0
+    spectator_yaw_deg: float = 0.0
+    spectator_roll_deg: float = 0.0
+    save_debug_images: bool = False
+    save_tracking_masks: bool = False
 
     def __post_init__(self) -> None:
-        """Load model config from checkpoint directory."""
-        if os.path.exists(self.config_path):
-            self.load_model_config()
-
-    def load_model_config(self) -> None:
-        """Load pose estimation config from training checkpoint."""
-        with open(self.config_path, "r") as f:
-            model_config = json.load(f)
-
-        # Update relevant fields
-        self.backbone = model_config.get("backbone", self.backbone)
-        self.bbox_mode = model_config.get("bbox_mode", self.bbox_mode)
-        self.model_image_size = tuple(
-            model_config.get("image_size", list(self.model_image_size))
-        )
-        self.pose_mean = tuple(
-            model_config.get("pose_mean", list(self.pose_mean))
-        )
-        self.pose_std = tuple(
-            model_config.get("pose_std", list(self.pose_std))
-        )
-        self.predict_dx = model_config.get("predict_dx", self.predict_dx)
-        self.predict_dy = model_config.get("predict_dy", self.predict_dy)
-        self.predict_dz = model_config.get("predict_dz", self.predict_dz)
-        self.predict_yaw = model_config.get("predict_yaw", self.predict_yaw)
+        if not self.checkpoint_path:
+            raise ValueError("checkpoint_path must be provided")
 
     @property
-    def num_outputs(self) -> int:
-        """Get the number of model output dimensions."""
-        return sum([
-            self.predict_dx,
-            self.predict_dy,
-            self.predict_dz,
-            self.predict_yaw,
-        ])
+    def run_output_dir(self) -> str:
+        if self.run_name:
+            return os.path.join(self.output_dir, self.run_name)
+        return self.output_dir
 
     @property
-    def output_names(self) -> list:
-        """Get names of output dimensions."""
-        names = []
-        if self.predict_dx:
-            names.append("dx")
-        if self.predict_dy:
-            names.append("dy")
-        if self.predict_dz:
-            names.append("dz")
-        if self.predict_yaw:
-            names.append("yaw")
-        return names
+    def summary_path(self) -> str:
+        return os.path.join(self.run_output_dir, "metrics.json")
+
+    @property
+    def frame_log_path(self) -> str:
+        return os.path.join(self.run_output_dir, "frames.jsonl")
+
+    @property
+    def closed_loop_report_path(self) -> str:
+        return os.path.join(self.run_output_dir, "closed_loop_report.txt")
+
+    @property
+    def debug_dir(self) -> str:
+        return os.path.join(self.run_output_dir, "debug")
+
+    @property
+    def ego_frames_dir(self) -> str:
+        return os.path.join(self.debug_dir, "ego_frames")
+
+    @property
+    def ego_video_path(self) -> str:
+        return os.path.join(self.run_output_dir, "ego.mp4")
+
+    @property
+    def tracker_masks_dir(self) -> str:
+        return os.path.join(self.debug_dir, "tracker_masks")
+
+    @property
+    def spectator_frames_dir(self) -> str:
+        return os.path.join(self.run_output_dir, "spectator_frames")
+
+    @property
+    def spectator_video_path(self) -> str:
+        return os.path.join(self.run_output_dir, "spectator.mp4")
+
+    def to_dict(self) -> dict:
+        payload = asdict(self)
+        if self.bootstrap_bbox_xyxy is not None:
+            payload["bootstrap_bbox_xyxy"] = list(self.bootstrap_bbox_xyxy)
+        return payload
+
+    def write(self) -> str:
+        os.makedirs(self.run_output_dir, exist_ok=True)
+        path = os.path.join(self.run_output_dir, "config.json")
+        with open(path, "w") as handle:
+            json.dump(self.to_dict(), handle, indent=2)
+        return path

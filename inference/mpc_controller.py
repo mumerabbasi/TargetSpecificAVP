@@ -1,8 +1,6 @@
-"""MPC controller for vehicle pursuit.
+"""Model predictive controller for target-specific pursuit inference."""
 
-This module implements a Model Predictive Controller using a Kinematic
-Bicycle Model for autonomous vehicle pursuit scenarios.
-"""
+from __future__ import annotations
 
 import math
 from dataclasses import dataclass
@@ -15,16 +13,9 @@ from .config import InferenceConfig
 
 @dataclass
 class VehicleState:
-    """Current state of the ego vehicle.
+    """Current ego-vehicle state used by the controller."""
 
-    Attributes:
-        speed: Current speed in m/s.
-        throttle: Current throttle value [0, 1].
-        steer: Current steering angle [-1, 1].
-        brake: Current brake value [0, 1].
-    """
-
-    speed: float = 0.0
+    speed_mps: float = 0.0
     throttle: float = 0.0
     steer: float = 0.0
     brake: float = 0.0
@@ -32,35 +23,17 @@ class VehicleState:
 
 @dataclass
 class TargetPose:
-    """Estimated pose of the target vehicle relative to ego.
+    """Relative target pose in the ego frame."""
 
-    CARLA coordinate system:
-        +x: Forward
-        +y: Right
-        yaw: Counter-clockwise positive (heading difference)
-
-    Attributes:
-        dx: Longitudinal distance in meters (+x forward).
-        dy: Lateral offset in meters (+y right).
-        dyaw: Relative yaw in degrees.
-        target_speed: Estimated speed of target in m/s (optional).
-    """
-
-    dx: float = 0.0
-    dy: float = 0.0
-    dyaw: float = 0.0
-    target_speed: float = 0.0
+    dx_m: float = 0.0
+    dy_m: float = 0.0
+    yaw_follow_deg: float = 0.0
+    target_speed_mps: float = 0.0
 
 
 @dataclass
 class ControlCommand:
-    """Control command for the ego vehicle.
-
-    Attributes:
-        throttle: Throttle value [0, 1].
-        steer: Steering angle [-1, 1], positive = right.
-        brake: Brake value [0, 1].
-    """
+    """Low-level control command for the ego vehicle."""
 
     throttle: float = 0.0
     steer: float = 0.0
@@ -68,62 +41,18 @@ class ControlCommand:
 
 
 class MPCController:
-    """MPC-based controller using Kinematic Bicycle Model.
-
-    Uses a non-linear optimization solver (SLSQP) to find the optimal
-    control sequence (acceleration and steering) that minimizes the
-    cost function over a prediction horizon.
-
-    Kinematic Bicycle Model:
-        $$x_{t+1} = x_t + v_t \\cos(\\psi_t) dt$$
-        $$y_{t+1} = y_t + v_t \\sin(\\psi_t) dt$$
-        $$\\psi_{t+1} = \\psi_t + \\frac{v_t}{L} \\tan(\\delta_t) dt$$
-        $$v_{t+1} = v_t + a_t dt$$
-
-    Attributes:
-        config: Inference configuration.
-        dt: Time step for prediction in seconds.
-        horizon: Number of steps to predict into the future.
-        wheelbase: Distance between front and rear axles (L).
-        u_prev: Previous control solution (used for warm-starting).
-        prev_steer_cmd: Previous steering command for low-pass filtering.
-    """
+    """Model predictive controller for target-vehicle pursuit."""
 
     def __init__(self, config: InferenceConfig) -> None:
-        """Initialize the MPC controller.
-
-        Args:
-            config: Inference configuration.
-        """
         self.config = config
+        self.dt = float(config.mpc_dt)
+        self.horizon = int(config.mpc_horizon)
+        self.wheelbase = float(config.wheelbase_m)
+        self.prev_solution = np.zeros(self.horizon * 2, dtype=np.float64)
+        self.prev_steer_cmd = 0.0
 
-        # MPC Parameters (from config)
-        self.dt = config.mpc_dt
-        self.horizon = config.mpc_horizon
-        self.wheelbase = config.wheelbase
-
-        # Constraints from config
-        self.max_steer_rad = config.max_steer_rad
-        self.max_accel = config.max_accel
-        self.max_decel = config.max_decel
-
-        # Cost weights from config
-        self.w_dist = config.w_dist
-        self.w_lat = config.w_lat
-        self.w_yaw = config.w_yaw
-        self.w_vel = config.w_vel
-        self.w_steer = config.w_steer
-        self.w_accel = config.w_accel
-        self.w_dsteer = config.w_dsteer
-        self.w_daccel = config.w_daccel
-
-        # Low-pass filter coefficient from config
-        self.steer_filter_alpha = config.steer_filter_alpha
-
-        # Warm start storage (flat array: [acc_0, steer_0, acc_1, steer_1, ...])
-        self.u_prev = np.zeros(self.horizon * 2)
-
-        # Previous steering command for filtering
+    def reset(self) -> None:
+        self.prev_solution = np.zeros(self.horizon * 2, dtype=np.float64)
         self.prev_steer_cmd = 0.0
 
     def compute_control(
@@ -131,192 +60,205 @@ class MPCController:
         target_pose: TargetPose,
         vehicle_state: VehicleState,
     ) -> ControlCommand:
-        """Compute control command using optimization.
+        """Solve one MPC step for the current target estimate."""
+        x0 = np.array(
+            [
+                float(target_pose.dx_m),
+                float(target_pose.dy_m),
+                math.radians(float(target_pose.yaw_follow_deg)),
+                float(vehicle_state.speed_mps),
+            ],
+            dtype=np.float64,
+        )
+        target_speed = max(0.0, float(target_pose.target_speed_mps))
+        ref = np.array(
+            [
+                float(self.config.desired_distance_m),
+                0.0,
+                0.0,
+                target_speed,
+            ],
+            dtype=np.float64,
+        )
 
-        Args:
-            target_pose: Estimated pose of target vehicle.
-            vehicle_state: Current state of ego vehicle.
-
-        Returns:
-            Control command for ego vehicle.
-        """
-        # Use target velocity from pose (from CARLA actor)
-        target_velocity = target_pose.target_speed
-
-        # Current State: [x, y, psi, v]
-        x0 = np.array([0.0, 0.0, 0.0, vehicle_state.speed])
-
-        # Convert dy from CARLA frame (Right+) to standard frame (Left+)
-        target_y_std = -target_pose.dy
-        target_yaw_rad = math.radians(target_pose.dyaw)
-
-        # Reference position: desired distance behind target
-        ref_x = target_pose.dx - self.config.desired_distance
-
-        # Reference velocity: match target speed
-        ref_velocity = target_velocity
-
-        # Reference vector [x, y, psi, v]
-        ref_state = np.array([ref_x, target_y_std, target_yaw_rad, ref_velocity])
-
-        # Define bounds for optimization
         bounds = []
         for _ in range(self.horizon):
-            bounds.append((self.max_decel, self.max_accel))
-            bounds.append((-self.max_steer_rad, self.max_steer_rad))
+            bounds.append(
+                (float(self.config.max_decel), float(self.config.max_accel))
+            )
+            bounds.append(
+                (-float(self.config.max_steer_rad), float(self.config.max_steer_rad))
+            )
 
-        # Warm start: shift previous solution
-        u_init = np.roll(self.u_prev, -2)
-        u_init[-2:] = 0.0
+        u_init = np.roll(self.prev_solution, -2)
+        accel_seed = self._initial_accel_seed(target_pose, vehicle_state)
+        steer_seed = self._initial_steer_seed(target_pose)
+        if not np.any(np.abs(u_init) > 1e-6):
+            for step in range(self.horizon):
+                u_init[2 * step] = accel_seed
+                u_init[2 * step + 1] = steer_seed
+        else:
+            u_init[-2] = accel_seed
+            u_init[-1] = steer_seed
 
+        init_cost = self._cost_function(u_init, x0, ref, target_speed)
         result = minimize(
             fun=self._cost_function,
             x0=u_init,
-            args=(x0, ref_state),
+            args=(x0, ref, target_speed),
             method="SLSQP",
             bounds=bounds,
-            options={"ftol": 1e-3, "disp": False, "maxiter": 30},
+            options={"ftol": 1e-3, "disp": False, "maxiter": 60},
         )
 
-        # Extract optimal control actions
-        self.u_prev = result.x
-        optimal_accel = result.x[0]
-        optimal_steer_rad = result.x[1]
+        optimal = u_init
+        if result.x is not None and np.all(np.isfinite(result.x)):
+            result_cost = self._cost_function(result.x, x0, ref, target_speed)
+            if result.success or result_cost < init_cost:
+                optimal = result.x
 
-        # Convert steering to CARLA frame [-1, 1]
-        # Internal: +Steer = Left, CARLA: +Steer = Right
-        raw_steer_cmd = -(optimal_steer_rad / self.max_steer_rad)
-        raw_steer_cmd = np.clip(raw_steer_cmd, -1.0, 1.0)
+        self.prev_solution = np.asarray(optimal, dtype=np.float64)
+        accel = float(self.prev_solution[0])
+        steer_rad = float(self.prev_solution[1])
 
-        # Apply low-pass filter to steering for smoothness
+        raw_steer_cmd = steer_rad / float(self.config.max_steer_rad)
+        raw_steer_cmd = float(np.clip(raw_steer_cmd, -1.0, 1.0))
         steer_cmd = (
-            self.steer_filter_alpha * self.prev_steer_cmd
-            + (1 - self.steer_filter_alpha) * raw_steer_cmd
+            float(self.config.steer_filter_alpha) * self.prev_steer_cmd
+            + (1.0 - float(self.config.steer_filter_alpha)) * raw_steer_cmd
         )
         self.prev_steer_cmd = steer_cmd
 
-        # Convert acceleration to throttle/brake
-        throttle_cmd = 0.0
-        brake_cmd = 0.0
-
-        if optimal_accel > 0:
-            throttle_cmd = optimal_accel / self.max_accel
+        throttle = 0.0
+        brake = 0.0
+        if accel > 0.0:
+            throttle = accel / float(self.config.max_accel)
         else:
-            brake_cmd = abs(optimal_accel) / abs(self.max_decel)
+            brake = abs(accel) / abs(float(self.config.max_decel))
 
-        # Apply safety limits
-        throttle_cmd = float(np.clip(throttle_cmd, 0.0, self.config.max_throttle))
-        brake_cmd = float(np.clip(brake_cmd, 0.0, self.config.max_brake))
-        steer_cmd = float(np.clip(steer_cmd, -self.config.max_steer, self.config.max_steer))
-
-        # Emergency brake if too close
-        if target_pose.dx < self.config.collision_distance:
-            return ControlCommand(throttle=0.0, steer=steer_cmd, brake=1.0)
-
-        # Gradual slowdown if approaching collision distance
-        if target_pose.dx < self.config.slowdown_distance:
-            slowdown_factor = (
-                (target_pose.dx - self.config.collision_distance)
-                / (self.config.slowdown_distance - self.config.collision_distance)
-            )
-            throttle_cmd *= slowdown_factor
-            brake_cmd = max(brake_cmd, 0.3 * (1 - slowdown_factor))
-
-        return ControlCommand(
-            throttle=throttle_cmd,
-            steer=steer_cmd,
-            brake=brake_cmd,
+        throttle = float(
+            np.clip(throttle, 0.0, float(self.config.max_throttle))
+        )
+        brake = float(np.clip(brake, 0.0, float(self.config.max_brake)))
+        steer_cmd = float(
+            np.clip(steer_cmd, -float(self.config.max_steer), float(self.config.max_steer))
         )
 
-    def _bicycle_model(
+        if (
+            throttle > 0.0
+            and float(vehicle_state.speed_mps) < float(self.config.launch_speed_threshold_mps)
+        ):
+            throttle = max(throttle, float(self.config.launch_throttle_floor))
+
+        if float(target_pose.dx_m) < float(self.config.collision_distance_m):
+            return ControlCommand(throttle=0.0, steer=steer_cmd, brake=1.0)
+
+        if float(target_pose.dx_m) < float(self.config.slowdown_distance_m):
+            denom = max(
+                float(self.config.slowdown_distance_m)
+                - float(self.config.collision_distance_m),
+                1e-6,
+            )
+            factor = (
+                float(target_pose.dx_m) - float(self.config.collision_distance_m)
+            ) / denom
+            factor = float(np.clip(factor, 0.0, 1.0))
+            throttle *= factor
+            brake = max(brake, 0.3 * (1.0 - factor))
+
+        return ControlCommand(throttle=throttle, steer=steer_cmd, brake=brake)
+
+    def _initial_accel_seed(
+        self,
+        target_pose: TargetPose,
+        vehicle_state: VehicleState,
+    ) -> float:
+        gap_error_m = float(target_pose.dx_m) - float(self.config.desired_distance_m)
+        speed_error_mps = float(target_pose.target_speed_mps) - float(
+            vehicle_state.speed_mps
+        )
+        accel_seed = 0.8 * gap_error_m + 1.2 * speed_error_mps
+        return float(
+            np.clip(
+                accel_seed,
+                float(self.config.max_decel),
+                float(self.config.max_accel),
+            )
+        )
+
+    def _initial_steer_seed(self, target_pose: TargetPose) -> float:
+        yaw_term = math.radians(float(target_pose.yaw_follow_deg))
+        lateral_term = math.atan2(
+            float(target_pose.dy_m),
+            max(float(target_pose.dx_m), 1e-3),
+        )
+        steer_seed = yaw_term + 0.8 * lateral_term
+        return float(
+            np.clip(
+                steer_seed,
+                -float(self.config.max_steer_rad),
+                float(self.config.max_steer_rad),
+            )
+        )
+
+    def _relative_model(
         self,
         state: np.ndarray,
         control: np.ndarray,
+        target_speed_mps: float,
     ) -> np.ndarray:
-        """Apply Kinematic Bicycle Model dynamics.
+        dx_m, dy_m, yaw_rel_rad, ego_speed_mps = state
+        accel, steer = control
+        ego_yaw_rate = 0.0
+        if abs(self.wheelbase) > 1e-6:
+            ego_yaw_rate = (ego_speed_mps / self.wheelbase) * math.tan(steer)
 
-        Args:
-            state: [x, y, psi, v]
-            control: [accel, steer_angle]
-
-        Returns:
-            Next state [x, y, psi, v]
-        """
-        x, y, psi, v = state
-        a, delta = control
-
-        # Kinematic bicycle model update
-        next_x = x + v * math.cos(psi) * self.dt
-        next_y = y + v * math.sin(psi) * self.dt
-        next_psi = psi + (v / self.wheelbase) * math.tan(delta) * self.dt
-        next_v = v + a * self.dt
-
-        # Prevent reversing
-        next_v = max(0.0, next_v)
-
-        return np.array([next_x, next_y, next_psi, next_v])
+        next_dx = dx_m + (
+            float(target_speed_mps) * math.cos(yaw_rel_rad)
+            - ego_speed_mps
+            + ego_yaw_rate * dy_m
+        ) * self.dt
+        next_dy = dy_m + (
+            float(target_speed_mps) * math.sin(yaw_rel_rad)
+            - ego_yaw_rate * dx_m
+        ) * self.dt
+        next_yaw = yaw_rel_rad - ego_yaw_rate * self.dt
+        next_yaw = (next_yaw + math.pi) % (2.0 * math.pi) - math.pi
+        next_speed = max(0.0, ego_speed_mps + accel * self.dt)
+        return np.array([next_dx, next_dy, next_yaw, next_speed], dtype=np.float64)
 
     def _cost_function(
         self,
         u_flat: np.ndarray,
         x0: np.ndarray,
         ref: np.ndarray,
+        target_speed_mps: float,
     ) -> float:
-        """Calculate total cost for the control sequence.
-
-        Args:
-            u_flat: Flattened control array [a0, s0, a1, s1, ...].
-            x0: Initial state.
-            ref: Reference target state [ref_x, ref_y, ref_psi, ref_v].
-
-        Returns:
-            Scalar cost.
-        """
         cost = 0.0
-        current_state = x0.copy()
+        state = x0.copy()
+        controls = np.asarray(u_flat, dtype=np.float64).reshape((self.horizon, 2))
+        prev_u = np.zeros(2, dtype=np.float64)
 
-        # Reshape controls to (Horizon, 2)
-        controls = u_flat.reshape((self.horizon, 2))
+        for step in range(self.horizon):
+            u_t = controls[step]
+            state = self._relative_model(state, u_t, target_speed_mps)
+            e_dx = state[0] - ref[0]
+            e_dy = state[1]
+            e_yaw = state[2]
+            e_speed = state[3] - ref[3]
 
-        prev_u = np.zeros(2)
+            cost += float(self.config.w_dist) * (e_dx ** 2)
+            cost += float(self.config.w_lat) * (e_dy ** 2)
+            cost += float(self.config.w_yaw) * (e_yaw ** 2)
+            cost += float(self.config.w_vel) * (e_speed ** 2)
+            cost += float(self.config.w_accel) * (u_t[0] ** 2)
+            cost += float(self.config.w_steer) * (u_t[1] ** 2)
 
-        for t in range(self.horizon):
-            u_t = controls[t]
-
-            # Update state using bicycle model
-            current_state = self._bicycle_model(current_state, u_t)
-
-            # Calculate tracking errors
-            e_dx = current_state[0] - ref[0]
-            e_dy = current_state[1] - ref[1]
-            e_psi = current_state[2] - ref[2]
-            e_v = current_state[3] - ref[3]
-
-            # Normalize yaw error to [-pi, pi]
-            e_psi = (e_psi + np.pi) % (2 * np.pi) - np.pi
-
-            # State costs
-            cost += self.w_dist * (e_dx ** 2)
-            cost += self.w_lat * (e_dy ** 2)
-            cost += self.w_yaw * (e_psi ** 2)
-            cost += self.w_vel * (e_v ** 2)  # Velocity matching cost
-
-            # Control costs (input minimization)
-            cost += self.w_accel * (u_t[0] ** 2)
-            cost += self.w_steer * (u_t[1] ** 2)
-
-            # Smoothness costs (change rate minimization)
-            if t > 0:
+            if step > 0:
                 d_accel = u_t[0] - prev_u[0]
                 d_steer = u_t[1] - prev_u[1]
-                cost += self.w_daccel * (d_accel ** 2)
-                cost += self.w_dsteer * (d_steer ** 2)
-
+                cost += float(self.config.w_daccel) * (d_accel ** 2)
+                cost += float(self.config.w_dsteer) * (d_steer ** 2)
             prev_u = u_t
 
-        return cost
-
-    def reset(self) -> None:
-        """Reset controller state."""
-        self.u_prev = np.zeros(self.horizon * 2)
-        self.prev_steer_cmd = 0.0
+        return float(cost)

@@ -1,40 +1,20 @@
-"""Inference module for vehicle pursuit using pose estimation and MPC control.
-
-This module provides:
-- PoseEstimator: CNN-based pose estimation from RGB + mask
-- MPCController: Model Predictive Control for vehicle following
-- CARLA utilities: World setup, sensors, target mask extraction
-- VehiclePursuit: Main pursuit loop integrating all components
-
-Usage:
-    cd robust-autonomous-vehicle-pursuit
-    conda activate 3d_detector
-    python -m inference.run_pursuit --town Town04 --duration 60 --save-images
-
-Or programmatically:
-    from inference.config import InferenceConfig
-    from inference.pose_estimator import PoseEstimator
-    from inference.mpc_controller import MPCController
-
-    config = InferenceConfig()
-    estimator = PoseEstimator(config)
-    controller = MPCController(config)
-"""
+"""Canonical inference stack for target-specific pursuit."""
 
 from .config import InferenceConfig
+from .metrics import InferenceMetrics
+from .mpc_controller import ControlCommand, MPCController, TargetPose, VehicleState
 from .pose_estimator import PoseEstimator
-from .mpc_controller import (
-    MPCController,
-    TargetPose,
-    VehicleState,
-    ControlCommand,
-)
+from .run_pursuit import run_pursuit
+from .tracker import OnlineSam3Tracker
 
 __all__ = [
     "InferenceConfig",
+    "InferenceMetrics",
     "PoseEstimator",
+    "OnlineSam3Tracker",
     "MPCController",
     "TargetPose",
     "VehicleState",
     "ControlCommand",
+    "run_pursuit",
 ]
