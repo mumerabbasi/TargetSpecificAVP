@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import csv
 import json
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
@@ -347,6 +348,54 @@ class InferenceMetrics:
         with open(self.config.closed_loop_report_path, "w") as handle:
             handle.write("\n".join(lines) + "\n")
 
+    def _write_pose_log(self) -> None:
+        fieldnames = [
+            "frame",
+            "tick",
+            "pred_dx_m",
+            "pred_dy_m",
+            "pred_dyaw_deg",
+            "gt_dx_m",
+            "gt_dy_m",
+            "gt_dyaw_deg",
+            "gt_follow_dyaw_deg",
+            "dx_error_m",
+            "dy_error_m",
+            "follow_dyaw_error_deg",
+            "pose_available",
+            "pose_stale",
+        ]
+
+        def _blank_if_none(value: object) -> object:
+            return "" if value is None else value
+
+        with open(self.config.pose_log_path, "w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in self.rows:
+                writer.writerow(
+                    {
+                        "frame": int(row["frame"]),
+                        "tick": int(row["tick"]),
+                        "pred_dx_m": _blank_if_none(row.get("used_dx_m")),
+                        "pred_dy_m": _blank_if_none(row.get("used_dy_m")),
+                        "pred_dyaw_deg": _blank_if_none(
+                            row.get("used_yaw_follow_deg")
+                        ),
+                        "gt_dx_m": float(row["gt_dx_m"]),
+                        "gt_dy_m": float(row["gt_dy_m"]),
+                        "gt_dyaw_deg": float(row["gt_yaw_deg"]),
+                        "gt_follow_dyaw_deg": float(row["gt_follow_yaw_deg"]),
+                        "dx_error_m": _blank_if_none(row.get("pose_dx_error_m")),
+                        "dy_error_m": _blank_if_none(row.get("pose_dy_error_m")),
+                        "follow_dyaw_error_deg": _blank_if_none(
+                            row.get("pose_follow_yaw_error_deg")
+                        ),
+                        "pose_available": int(bool(row.get("pose_available", False))),
+                        "pose_stale": int(bool(row.get("pose_stale", False))),
+                    }
+                )
+
     def write(self, completion_reason: str) -> str:
         summary = self.summarize(completion_reason)
         with open(self.config.summary_path, "w") as handle:
@@ -354,6 +403,7 @@ class InferenceMetrics:
         with open(self.config.frame_log_path, "w") as handle:
             for row in self.rows:
                 handle.write(json.dumps(row) + "\n")
+        self._write_pose_log()
         self._write_closed_loop_report(
             summary["closed_loop_metrics"],
             completion_reason,

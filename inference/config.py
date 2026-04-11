@@ -135,6 +135,10 @@ class InferenceConfig:
         return os.path.join(self.run_output_dir, "frames.jsonl")
 
     @property
+    def pose_log_path(self) -> str:
+        return os.path.join(self.run_output_dir, "pose_log.csv")
+
+    @property
     def closed_loop_report_path(self) -> str:
         return os.path.join(self.run_output_dir, "closed_loop_report.txt")
 

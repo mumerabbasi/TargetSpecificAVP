@@ -31,6 +31,7 @@ runs/
 outputs/
 artifacts/
 checkpoints/
+inference_output/
 # Ignore all run artifacts, but keep selected per-run JSON files trackable.
 target_pose_runs/*
 !target_pose_runs/*/
