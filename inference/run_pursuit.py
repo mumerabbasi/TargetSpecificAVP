@@ -655,8 +655,8 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint",
         type=str,
         default=(
-            "/usr/prakt/s0050/ravp/pose_estimation_runs/"
-            "pose_estimation_20251129_220737/best_model.pth"
+            "/usr/prakt/s0050/ravp/target_pose_runs/"
+            "target_pose_regressor_gt/best.pt"
         ),
         help="Path to model checkpoint",
     )
