@@ -31,6 +31,13 @@ runs/
 outputs/
 artifacts/
 checkpoints/
+# Ignore all run artifacts, but keep selected per-run JSON files trackable.
+target_pose_runs/*
+!target_pose_runs/*/
+target_pose_runs/*/*
+!target_pose_runs/*/config.json
+!target_pose_runs/*/split_summary.json
+!target_pose_runs/*/translation_stats.json
 debug/
 tmp/
 
@@ -60,3 +67,4 @@ recordings/
 spectator_frames/
 *.avi
 *.mov
+
