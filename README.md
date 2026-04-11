@@ -99,18 +99,6 @@ The repo has two clearly separated layers:
         └─────────────────────────────────────┘
 ```
 
-Supporting training pipeline:
-
-```text
-CARLA Episodes
-    → per-target dataset generation
-    → pose labels and masks
-    → target_pose_regression training
-    → checkpoint used in pursuit inference
-```
-
----
-
 ## Current And Legacy Variants
 
 ### Current main pipeline
@@ -134,7 +122,7 @@ The learned model predicts:
 
 The current demo video asset is a **legacy demo** from an earlier variant where the main difference was the **data-generation / pose-labeling strategy**, not the high-level pursuit objective.
 
-That legacy branch still trained a CNN from **RGB + target mask** for target-relative pose prediction. The key difference was how the pose supervision was generated.
+That legacy branch trained the same CNN for target-relative pose prediction. The key difference was how the pose supervision was generated.
 
 That older variant worked as follows:
 
@@ -146,11 +134,9 @@ That older variant worked as follows:
 6. Estimate `dx` and `dy` from the **centroid** of the target point cloud
 7. Estimate `dyaw` from the **first PCA component** of the target car point cloud, assuming it roughly aligns with the vehicle's longitudinal axis
 
-So the legacy pipeline still used an RGB-plus-mask CNN, but its training labels came from stereo depth, filtered target point clouds, centroid translation estimates, and PCA-based yaw estimates instead of the current LiDAR-plus-3D-detector pipeline.
+So the legacy pipeline training labels came from stereo depth, filtered target point clouds, centroid translation estimates, and PCA-based yaw estimates instead of the current LiDAR-plus-3D-detector pipeline.
 
 In practice, the `dx`, `dy`, and `dyaw` errors from that PCA-based pose-labeling path were fairly high. Those noisy labels hurt downstream CNN training, which then produced weaker pursuit behavior with noticeable **oscillatory lateral corrections** rather than smooth target following.
-
-So the demo still reflects the same target-pursuit idea, but it is not showcasing the current version of the RGB-plus-mask CNN pipeline, which uses the newer LiDAR-plus-3D-detector supervision path.
 
 ---
 
@@ -235,8 +221,6 @@ The saved run directory includes:
 - `history.json`
 - `best.pt`
 - `last.pt`
-
-W&B logging is enabled by default for losses only.
 
 ---
 
@@ -361,6 +345,6 @@ RAVP/
 
 <div align="center">
 
-Built around the goal of following the right car, not just the nearest one.
+Research Project at the **Computer Vision Group**, **Technical University of Munich**
 
 </div>
