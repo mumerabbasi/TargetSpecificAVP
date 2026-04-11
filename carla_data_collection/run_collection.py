@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI for the compact single-pass RAVP dataset pipeline."""
+"""CLI for the single-pass RAVP dataset pipeline."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compact RAVP dataset pipeline")
+        description="RAVP dataset pipeline")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     collect = subparsers.add_parser(

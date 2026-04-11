@@ -1,4 +1,4 @@
-"""MMDetection3D inference wrapper for compact per-frame pose labels."""
+"""MMDetection3D inference wrapper for per-frame pose labels."""
 
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ class MMDet3DDetector:
             from mmdet3d.apis import init_model
         except ImportError as exc:
             raise ImportError(
-                "mmdet3d is required for compact collection and reporting."
+                "mmdet3d is required for dataset collection and reporting."
             ) from exc
 
         self.device = spec.device

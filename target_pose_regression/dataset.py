@@ -58,7 +58,7 @@ class TranslationStats:
 
 
 def load_pose_rows(config: TargetPoseTrainingConfig) -> List[Dict[str, str]]:
-    """Load the selected compact pose CSV and apply training filters."""
+    """Load the selected pose CSV and apply training filters."""
     dataset_root = Path(config.dataset_root)
     csv_path = dataset_root / config.csv_name
     if not csv_path.exists():
@@ -139,7 +139,7 @@ def build_group_splits(
 def split_summary(
     rows_by_split: Mapping[str, Sequence[Mapping[str, str]]],
 ) -> Dict[str, Dict[str, int]]:
-    """Build a compact summary of row, frame, and group counts."""
+    """Build a concise summary of row, frame, and group counts."""
     summary: Dict[str, Dict[str, int]] = {}
     for split_name, rows in rows_by_split.items():
         frame_keys = {(row["town"], row["frame_id"]) for row in rows}

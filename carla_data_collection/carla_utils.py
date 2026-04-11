@@ -1,4 +1,4 @@
-"""CARLA helpers for the compact single-pass collection pipeline."""
+"""CARLA helpers for the single-pass collection pipeline."""
 
 from __future__ import annotations
 

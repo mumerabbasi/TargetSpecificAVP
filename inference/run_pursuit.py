@@ -1,750 +1,510 @@
-"""Main script for vehicle pursuit using pose estimation and MPC control."""
+"""CLI entry point for CNN-based target-specific pursuit inference."""
 
-import os
+from __future__ import annotations
+
 import argparse
+import json
+import os
+import shutil
+import subprocess
 import time
-from typing import Dict, Optional
+from datetime import UTC, datetime
+from typing import Optional, Tuple
 
-import carla
 import cv2
 import numpy as np
 
-from .carla_utils import (
-    apply_control,
-    cleanup_actors,
-    compute_ground_truth_pose,
-    connect_to_carla,
-    get_all_vehicle_masks,
-    get_vehicle_speed,
-    get_vehicle_state,
-    match_instance_to_actor,
-    SensorManager,
-    SpectatorManager,
-    set_autopilot,
-    setup_world,
-    spawn_ego_vehicle,
-    spawn_target_vehicles,
-)
 from .config import InferenceConfig
-from .mpc_controller import (
-    MPCController,
-    TargetPose,
-    VehicleState,
-)
+from .geometry import canonicalize_follow_yaw_deg, expand_bbox, mask_iou
+from .metrics import InferenceMetrics, build_frame_metrics_row
+from .mpc_controller import ControlCommand, MPCController, TargetPose, VehicleState
 from .pose_estimator import PoseEstimator
+from .scenario import PursuitScenario
+from .tracker import OnlineSam3Tracker
 
 
-class VehiclePursuit:
-    """Main class for vehicle pursuit demonstration.
+def _ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
 
-    Integrates pose estimation, MPC control, and CARLA simulation
-    to pursue a target vehicle.
 
-    Attributes:
-        config: Inference configuration.
-        client: CARLA client.
-        world: CARLA world.
-        ego: Ego vehicle.
-        targets: List of target vehicles (for autopilot).
-        sensor_manager: Sensor manager for cameras.
-        spectator_manager: Spectator camera manager.
-        pose_estimator: CNN-based pose estimator.
-        controller: MPC controller.
-    """
+def _next_run_name(config: InferenceConfig) -> str:
+    stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    return f"{stamp}_{config.town}"
 
-    def __init__(self, config: InferenceConfig):
-        """Initialize vehicle pursuit.
 
-        Args:
-            config: Inference configuration.
-        """
-        self.config = config
-        self.client: Optional[carla.Client] = None
-        self.world: Optional[carla.World] = None
-        self.ego: Optional[carla.Vehicle] = None
-        self.targets: list = []  # For autopilot targets
-        # The target we're pursuing
-        self.tracked_target: Optional[carla.Vehicle] = None
-        self.instance_to_actor: dict = {}  # Maps instance_id -> carla.Vehicle
-        self.sensor_manager: Optional[SensorManager] = None
-        self.spectator_manager: Optional[SpectatorManager] = None
-        self.pose_estimator: Optional[PoseEstimator] = None
-        self.controller: Optional[MPCController] = None
+def _save_spectator_frame(
+    config: InferenceConfig,
+    frame_idx: int,
+    image: Optional[np.ndarray],
+) -> Optional[str]:
+    if image is None:
+        return None
+    _ensure_dir(config.spectator_frames_dir)
+    frame_path = os.path.join(config.spectator_frames_dir, f"frame_{frame_idx:06d}.png")
+    cv2.imwrite(frame_path, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+    return frame_path
 
-        # Statistics
-        self.frame_count = 0
-        self.total_time = 0.0
-        self.pose_errors = []
 
-        # Output directories
-        self.output_dir = config.video_output_dir
-        self.ego_output_dir = os.path.join(self.output_dir, "ego")
-        self.spectator_output_dir = os.path.join(self.output_dir, "spectator")
-        os.makedirs(self.ego_output_dir, exist_ok=True)
-        os.makedirs(self.spectator_output_dir, exist_ok=True)
+def _save_ego_debug_frame(
+    config: InferenceConfig,
+    frame_idx: int,
+    rgb_image: np.ndarray,
+    target_mask: Optional[np.ndarray],
+    used_pose: Optional[dict],
+    gt_pose: dict,
+    control: ControlCommand,
+) -> Optional[str]:
+    if not bool(config.save_debug_images):
+        return None
 
-    def setup(self) -> None:
-        """Setup CARLA world, vehicles, sensors, and models."""
-        print("\n" + "=" * 60)
-        print("VEHICLE PURSUIT SETUP")
-        print("=" * 60)
+    _ensure_dir(config.ego_frames_dir)
+    frame = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
 
-        # Connect to CARLA
-        self.client = connect_to_carla(self.config)
-        self.world = setup_world(self.client, self.config)
+    if target_mask is not None and np.any(target_mask):
+        mask_overlay = np.zeros_like(frame)
+        mask_overlay[:, :, 1] = target_mask.astype(np.uint8) * 255
+        frame = cv2.addWeighted(frame, 1.0, mask_overlay, 0.3, 0.0)
 
-        # Clear existing vehicles
-        print("[Setup] Cleaning up existing vehicles...")
-        for actor in self.world.get_actors().filter("vehicle.*"):
-            try:
-                actor.destroy()
-            except RuntimeError:
-                pass
+        ys, xs = np.where(target_mask.astype(bool))
+        x1, y1 = int(xs.min()), int(ys.min())
+        x2, y2 = int(xs.max()), int(ys.max())
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-        for _ in range(10):
-            self.world.tick()
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    y = 30
 
-        # Spawn ego vehicle
-        spawn_pts = self.world.get_map().get_spawn_points()
-        self.ego = spawn_ego_vehicle(self.world, spawn_point=spawn_pts[100])
+    def add_text(text: str, color: Tuple[int, int, int]) -> None:
+        nonlocal y
+        cv2.putText(frame, text, (10, y), font, 0.6, color, 2)
+        y += 24
 
-        # Spawn target vehicles
-        self.targets = spawn_target_vehicles(
-            self.world, self.ego, self.config
+    add_text(f"Frame: {frame_idx}", (255, 255, 255))
+    add_text(
+        "GT: "
+        f"dx={gt_pose['dx_m']:.2f}m "
+        f"dy={gt_pose['dy_m']:.2f}m "
+        f"yaw_f={canonicalize_follow_yaw_deg(gt_pose['yaw_deg']):.1f}deg",
+        (255, 255, 0),
+    )
+    if used_pose is not None:
+        add_text(
+            "Pred: "
+            f"dx={used_pose['dx_m']:.2f}m "
+            f"dy={used_pose['dy_m']:.2f}m "
+            f"yaw_f={used_pose['yaw_follow_deg']:.1f}deg",
+            (0, 255, 0),
         )
-
-        # Let vehicles settle
-        for _ in range(20):
-            self.world.tick()
-
-        # Enable autopilot for targets (so they drive)
-        tm = self.client.get_trafficmanager()
-        for target in self.targets:
-            set_autopilot(target, enabled=True)
-            tm.vehicle_percentage_speed_difference(target, 60)
-
-        # Select the first target (ahead) as the one to track
-        if self.targets:
-            self.tracked_target = self.targets[0]
-            print(f"[Setup] Primary target: {self.tracked_target.id}")
-
-        print(f"[Setup] {len(self.targets)} target vehicles with autopilot")
-
-        # Setup sensors
-        self.sensor_manager = SensorManager(
-            self.world, self.ego, self.config
-        )
-
-        # Setup spectator camera - behind target, facing ego
-        self.spectator_manager = SpectatorManager(
-            self.world, height=25.0, distance=25.0
-        )
-        # Attach to tracked target, with ego as reference
-        if self.tracked_target:
-            self.spectator_manager.setup_camera(self.tracked_target, self.ego)
-        else:
-            self.spectator_manager.setup_camera(self.ego)
-
-        # Warm up sensors
-        print("[Setup] Warming up sensors...")
-        for _ in range(10):
-            self.world.tick()
-            self.sensor_manager.clear_queues()
-            self.spectator_manager.clear_queue()
-
-        # Initialize pose estimator
-        print("[Setup] Loading pose estimation model...")
-        self.pose_estimator = PoseEstimator(self.config)
-
-        # Initialize controller
-        print("[Setup] Initializing MPC controller...")
-        self.controller = MPCController(self.config)
-
-        print("\n[Setup] Complete!")
-        print("=" * 60 + "\n")
-
-    def _initialize_tracking(
-        self,
-        rgb_image: np.ndarray,
-        instance_image: np.ndarray,
-    ) -> bool:
-        """Initialize tracking by mapping instance IDs to actor IDs.
-
-        In the first frame:
-        1. Find all vehicle instance IDs
-        2. Get bbox mask for each and run pose estimation
-        3. Get ground truth poses for all target actors
-        4. Match instance IDs to actor IDs by pose similarity
-        5. Select which instance to track (the one matching target_ahead)
-
-        Args:
-            rgb_image: RGB image.
-            instance_image: Instance segmentation image.
-
-        Returns:
-            True if tracking initialized successfully.
-        """
-        print("\n[Init] Initializing instance-to-actor mapping...")
-
-        # Get all vehicle masks
-        all_masks = get_all_vehicle_masks(
-            self.sensor_manager, instance_image, min_pixels=100
-        )
-
-        if not all_masks:
-            print("[Init] No vehicles found in first frame")
-            return False
-
-        print(
-            f"[Init] Found {
-                len(all_masks)} vehicle instances: {
-                list(
-                    all_masks.keys())}")
-
-        # Run pose estimation on each instance
-        instance_poses: Dict[int, dict] = {}
-        for inst_id, mask in all_masks.items():
-            pose = self.pose_estimator.estimate_pose(rgb_image, mask)
-            instance_poses[inst_id] = pose
-            print(f"[Init]   Instance {inst_id}: dx={pose['dx']:.2f}m, "
-                  f"dy={pose['dy']:.2f}m, dyaw={pose.get('dyaw', 0):.1f}°")
-
-        # Match instances to actors using ground truth poses
-        self.instance_to_actor = match_instance_to_actor(
-            instance_poses, self.targets, self.ego, max_match_dist=8.0
-        )
-
-        print(
-            f"[Init] Matched {len(self.instance_to_actor)} instances to actors:")
-        for inst_id, actor in self.instance_to_actor.items():
-            role = actor.attributes.get(
-                "role_name", "unknown") if actor else "None"
-            actor_id = actor.id if actor else "N/A"
-            print(
-                f"[Init]   Instance {inst_id} -> Actor {actor_id} (role={role})")
-
-        # Select instance to track: prefer the one matching target_ahead
-        selected_instance = None
-
-        # Find instance matching tracked_target (target_ahead)
-        if self.tracked_target:
-            for inst_id, actor in self.instance_to_actor.items():
-                if actor is not None and actor.id == self.tracked_target.id:
-                    selected_instance = inst_id
-                    print(
-                        f"[Init] Selected instance {inst_id} (matched target_ahead)")
-                    break
-
-        # Fallback: select largest vehicle closest to center
-        if selected_instance is None and all_masks:
-            height, width = instance_image.shape[:2]
-            center_x = width // 2
-
-            best_inst = None
-            best_dist = float("inf")
-
-            vehicles = self.sensor_manager.find_vehicle_instances(
-                instance_image, 100)
-            for inst_id, count, bbox in vehicles:
-                if inst_id in all_masks:
-                    bbox_center = (bbox[0] + bbox[2]) // 2
-                    dist = abs(bbox_center - center_x)
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_inst = inst_id
-
-            if best_inst is not None:
-                selected_instance = best_inst
-                print(
-                    f"[Init] Fallback: selected instance {selected_instance} (center)")
-
-        if selected_instance is not None:
-            self.sensor_manager.set_tracked_instance(selected_instance)
-            return True
-
-        print("[Init] Failed to select a vehicle to track")
-        return False
-
-    def run(self) -> None:
-        """Run the pursuit loop."""
-        print("\n" + "=" * 60)
-        print("STARTING PURSUIT")
-        print("=" * 60)
-        print(f"Number of frames: {self.config.num_frames}")
-        print(f"Desired following distance: {self.config.desired_distance}m")
-        print("Press Ctrl+C to stop\n")
-
-        start_time = time.time()
-        last_print_time = start_time
-        tracking_initialized = False
-
-        try:
-            while self.frame_count < self.config.num_frames:
-
-                # Step simulation
-                self.world.tick()
-
-                # Update spectator view (behind target, facing ego)
-                self.spectator_manager.update(self.tracked_target, self.ego)
-
-                # Get sensor data
-                rgb_image, instance_image = self.sensor_manager.get_sensor_data(
-                    timeout=1.0)
-
-                if rgb_image is None or instance_image is None:
-                    print("[Warning] Missing sensor data, skipping frame")
-                    continue
-
-                # First frame: initialize tracking with instance-to-actor
-                # mapping
-                if not tracking_initialized:
-                    if not self._initialize_tracking(
-                            rgb_image, instance_image):
-                        print("[Warning] Tracking init failed, retrying...")
-                        continue
-                    tracking_initialized = True
-
-                # Get mask for tracked instance
-                target_mask, tracked_id = self.sensor_manager.get_tracked_mask(
-                    instance_image
-                )
-
-                if target_mask is None:
-                    print("[Warning] Lost track of instance, skipping frame")
-                    continue
-
-                # Estimate pose for the tracked vehicle
-                frame_start = time.time()
-                estimated_pose = self.pose_estimator.estimate_pose(
-                    rgb_image, target_mask
-                )
-                inference_time = time.time() - frame_start
-
-                # Get ground truth from matched actor
-                gt_pose = None
-                matched_actor = self.instance_to_actor.get(tracked_id)
-                if matched_actor is not None and matched_actor.is_alive:
-                    gt_pose = compute_ground_truth_pose(
-                        self.ego, matched_actor)
-
-                # Store pose for statistics
-                self.pose_errors.append({
-                    "dx": estimated_pose["dx"],
-                    "dy": estimated_pose["dy"],
-                    "dyaw": estimated_pose.get("dyaw", 0.0),
-                    "gt_dx": gt_pose["dx"] if gt_pose else None,
-                    "gt_dy": gt_pose["dy"] if gt_pose else None,
-                    "gt_dyaw": gt_pose["dyaw"] if gt_pose else None,
-                })
-
-                # Get vehicle state
-                vehicle_state_dict = get_vehicle_state(self.ego)
-                vehicle_state = VehicleState(
-                    speed=vehicle_state_dict["speed"],
-                    throttle=vehicle_state_dict["throttle"],
-                    steer=vehicle_state_dict["steer"],
-                    brake=vehicle_state_dict["brake"],
-                )
-
-                # Get target velocity from matched actor (if available)
-                target_speed = 0.0
-                if matched_actor is not None and matched_actor.is_alive:
-                    target_speed = get_vehicle_speed(matched_actor)
-
-                # Create target pose object with velocity
-                target_pose = TargetPose(
-                    dx=estimated_pose["dx"],
-                    dy=estimated_pose["dy"],
-                    dyaw=estimated_pose.get("dyaw", 0.0),
-                    target_speed=target_speed,
-                )
-
-                # Compute control
-                control_cmd = self.controller.compute_control(
-                    target_pose, vehicle_state
-                )
-
-                # Apply control
-                apply_control(
-                    self.ego,
-                    control_cmd.throttle,
-                    control_cmd.steer,
-                    control_cmd.brake,
-                )
-
-                # Update statistics
-                self.frame_count += 1
-                self.total_time += inference_time
-
-                # Print debug info periodically
-                current_time = time.time()
-                elapsed = current_time - start_time
-                if current_time - last_print_time >= 1.0:
-                    self._print_debug_info(
-                        elapsed,
-                        estimated_pose,
-                        vehicle_state,
-                        control_cmd,
-                        inference_time,
-                        tracked_id,
-                        gt_pose,
-                    )
-                    last_print_time = current_time
-
-                # Save images
-                if self.config.save_video:
-                    self._save_images(
-                        rgb_image,
-                        target_mask,
-                        estimated_pose,
-                        control_cmd,
-                        gt_pose,
-                    )
-
-        except KeyboardInterrupt:
-            print("\n[Pursuit] Interrupted by user")
-
-        finally:
-            self._print_final_stats()
-
-    def _print_debug_info(
-        self,
-        elapsed: float,
-        estimated_pose: dict,
-        vehicle_state: VehicleState,
-        control_cmd,
-        inference_time: float,
-        tracked_id: Optional[int] = None,
-        gt_pose: Optional[dict] = None,
-    ) -> None:
-        """Print debug information."""
-        progress = self.frame_count / self.config.num_frames * 100
-        print(f"\n[t={elapsed:.1f}s] Frame {self.frame_count}/{self.config.num_frames} "
-              f"({progress:.1f}%)")
-        if tracked_id is not None:
-            actor_id = self.instance_to_actor.get(tracked_id)
-            actor_str = f", actor={actor_id.id}" if actor_id else ""
-            print(f"  Tracking: instance_id={tracked_id}{actor_str}")
-        print(f"  Pred: dx={estimated_pose['dx']:.2f}m, "
-              f"dy={estimated_pose['dy']:.2f}m, "
-              f"dyaw={estimated_pose.get('dyaw', 0.0):.1f}°")
-        if gt_pose is not None:
-            print(f"  GT:   dx={gt_pose['dx']:.2f}m, "
-                  f"dy={gt_pose['dy']:.2f}m, "
-                  f"dyaw={gt_pose['dyaw']:.1f}°")
-            err_dx = estimated_pose['dx'] - gt_pose['dx']
-            err_dy = estimated_pose['dy'] - gt_pose['dy']
-            err_dyaw = estimated_pose.get('dyaw', 0.0) - gt_pose['dyaw']
-            print(
-                f"  Err:  dx={
-                    err_dx:.2f}m, dy={
-                    err_dy:.2f}m, dyaw={
-                    err_dyaw:.1f}°")
-        print(f"  Speed: {vehicle_state.speed * 3.6:.1f} km/h")
-        print(f"  Control: throttle={control_cmd.throttle:.2f}, "
-              f"steer={control_cmd.steer:.2f}, "
-              f"brake={control_cmd.brake:.2f}")
-        print(f"  Inference: {inference_time * 1000:.1f}ms")
-
-    def _save_images(
-        self,
-        rgb_image: np.ndarray,
-        target_mask: np.ndarray,
-        estimated_pose: dict,
-        control_cmd,
-        gt_pose: Optional[dict] = None,
-    ) -> None:
-        """Save ego camera and spectator camera images.
-
-        Args:
-            rgb_image: Ego camera RGB image.
-            target_mask: Binary mask of target.
-            estimated_pose: Estimated pose.
-            control_cmd: Control command.
-            gt_pose: Ground truth pose (if available).
-        """
-        # Create ego camera visualization
-        ego_frame = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
-
-        # Overlay mask with transparency
-        mask_overlay = np.zeros_like(ego_frame)
-        mask_overlay[:, :, 1] = target_mask * 255  # Green channel
-        ego_frame = cv2.addWeighted(ego_frame, 1.0, mask_overlay, 0.3, 0)
-
-        # Draw bounding box around target
-        if target_mask.sum() > 0:
-            bbox = self.pose_estimator.get_bbox_from_mask(target_mask)
-            if bbox is not None:
-                x1, y1, x2, y2 = bbox
-                cv2.rectangle(ego_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-        # Add text overlay
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        y_offset = 30
-
-        # Predicted pose (green)
-        pred_dyaw = estimated_pose.get('dyaw', 0.0)
-        text = f"Pred: dx={
-            estimated_pose['dx']:.1f}m, dy={
-            estimated_pose['dy']:.1f}m, yaw={
-            pred_dyaw:.1f}"
-        cv2.putText(ego_frame, text, (10, y_offset), font, 0.6, (0, 255, 0), 2)
-        y_offset += 25
-
-        # Ground truth pose (cyan)
-        if gt_pose is not None:
-            text = f"GT:   dx={
-                gt_pose['dx']:.1f}m, dy={
-                gt_pose['dy']:.1f}m, yaw={
-                gt_pose['dyaw']:.1f}"
-            cv2.putText(ego_frame, text, (10, y_offset),
-                        font, 0.6, (255, 255, 0), 2)
-            y_offset += 25
-
-            # Error (red/magenta)
-            err_dx = estimated_pose['dx'] - gt_pose['dx']
-            err_dy = estimated_pose['dy'] - gt_pose['dy']
-            err_dyaw = pred_dyaw - gt_pose['dyaw']
-            text = f"Err:  dx={
-                err_dx:.2f}m, dy={
-                err_dy:.2f}m, yaw={
-                err_dyaw:.1f}"
-            cv2.putText(ego_frame, text, (10, y_offset),
-                        font, 0.6, (255, 0, 255), 2)
-            y_offset += 25
-
-        # Control (white)
-        text = f"Ctrl: T={
-            control_cmd.throttle:.2f}, S={
-            control_cmd.steer:.2f}, B={
-            control_cmd.brake:.2f}"
-        cv2.putText(ego_frame, text, (10, y_offset),
-                    font, 0.6, (255, 255, 255), 2)
-        y_offset += 25
-
-        # Frame number
-        text = f"Frame: {self.frame_count}"
-        cv2.putText(ego_frame, text, (10, y_offset),
-                    font, 0.6, (255, 255, 255), 2)
-
-        # Save ego camera image
-        ego_path = os.path.join(
-            self.ego_output_dir, f"ego_{self.frame_count:05d}.png"
-        )
-        cv2.imwrite(ego_path, ego_frame)
-
-        # Get and save spectator camera image
-        spectator_image = self.spectator_manager.get_image(timeout=0.1)
-        if spectator_image is not None:
-            spectator_frame = cv2.cvtColor(spectator_image, cv2.COLOR_RGB2BGR)
-
-            # Add frame number overlay
-            cv2.putText(
-                spectator_frame,
-                f"Frame: {self.frame_count}",
-                (10, 30),
-                font,
-                1.0,
-                (255, 255, 255),
-                2,
+    else:
+        add_text("Pred: unavailable", (0, 0, 255))
+    add_text(
+        f"Ctrl: T={control.throttle:.2f} S={control.steer:.2f} B={control.brake:.2f}",
+        (255, 255, 255),
+    )
+
+    path = os.path.join(config.ego_frames_dir, f"frame_{frame_idx:06d}.png")
+    cv2.imwrite(path, frame)
+    return path
+
+
+def _build_video(frames_dir: str, output_path: str, fps: float) -> Optional[str]:
+    if not os.path.isdir(frames_dir):
+        return None
+    png_files = [name for name in os.listdir(frames_dir) if name.endswith(".png")]
+    if not png_files:
+        return None
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-framerate",
+        f"{fps:.4f}",
+        "-i",
+        os.path.join(frames_dir, "frame_%06d.png"),
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        output_path,
+    ]
+    subprocess.run(cmd, check=True)
+    return output_path
+
+
+def _write_artifact_summary(
+    summary_path: str,
+    *,
+    ego_video_path: Optional[str],
+    spectator_video_path: Optional[str],
+) -> None:
+    with open(summary_path, "r") as handle:
+        summary = json.load(handle)
+    summary["artifacts"] = {
+        "ego_video_path": ego_video_path,
+        "spectator_video_path": spectator_video_path,
+    }
+    with open(summary_path, "w") as handle:
+        json.dump(summary, handle, indent=2)
+
+
+def run_pursuit(config: InferenceConfig) -> str:
+    """Run the full SAM3 + CNN + MPC pursuit pipeline."""
+    if not config.run_name:
+        config.run_name = _next_run_name(config)
+    if os.path.isdir(config.run_output_dir):
+        shutil.rmtree(config.run_output_dir)
+    _ensure_dir(config.run_output_dir)
+    config.write()
+
+    scenario = PursuitScenario(config)
+    metrics = InferenceMetrics(config)
+    tracker = OnlineSam3Tracker(config)
+    pose_estimator = PoseEstimator(config)
+    controller = MPCController(config)
+
+    completion_reason = "max_frames"
+    last_pose: Optional[dict] = None
+    last_prompt_bbox: Optional[Tuple[int, int, int, int]] = None
+    stale_frames = 0
+    invisible_streak = 0
+    offroad_streak = 0
+    lost_streak = 0
+
+    try:
+        scenario.setup()
+
+        for frame_idx in range(int(config.num_frames)):
+            packet = scenario.tick()
+            ego_collision_events = scenario.ego_events.consume_collision_events()
+            target_collision_events = scenario.target_events.consume_collision_events()
+
+            if not scenario.target_alive():
+                completion_reason = "target_destroyed"
+                break
+            if not scenario.ego_alive():
+                completion_reason = "ego_destroyed"
+                break
+
+            gt_pose = scenario.ground_truth_pose()
+            ego_state = scenario.ego_vehicle_state()
+            ego_world_state = scenario.ego_world_state()
+            target_state = scenario.target_vehicle_state()
+            offroad = bool(scenario.ego_offroad())
+            offroad_streak = offroad_streak + 1 if offroad else 0
+            absolute_distance_m = float(scenario.absolute_distance())
+
+            gt_prompt_bbox = scenario.sensors.project_actor_bbox(scenario.target)
+            gt_target_mask = scenario.sensors.target_instance_mask(
+                packet.instance_image,
+                gt_prompt_bbox,
             )
 
-            spectator_path = os.path.join(
-                self.spectator_output_dir, f"spectator_{
-                    self.frame_count:05d}.png")
-            cv2.imwrite(spectator_path, spectator_frame)
+            bootstrap_bbox = None
+            if frame_idx == 0:
+                if config.bootstrap_bbox_xyxy is not None:
+                    bootstrap_bbox = tuple(int(v) for v in config.bootstrap_bbox_xyxy)
+                elif (
+                    bool(config.bootstrap_with_projected_bbox)
+                    and gt_prompt_bbox is not None
+                ):
+                    bootstrap_bbox = expand_bbox(
+                        gt_prompt_bbox,
+                        int(config.prompt_bbox_pad_px),
+                        int(config.image_width),
+                        int(config.image_height),
+                    )
 
-    def _print_final_stats(self) -> None:
-        """Print final statistics."""
-        print("\n" + "=" * 60)
-        print("PURSUIT STATISTICS")
-        print("=" * 60)
+            used_pose = None
+            pose_available = False
+            pose_stale = False
+            pose_latency_ms = 0.0
+            mask_iou_value = None
+            mask_available = False
+            bbox_bootstrap_used = False
+            bbox_reseed_requested = False
+            bbox_reseed_used = False
+            tracker_logit_max = None
+            tracker_threshold = None
+            pred_mask = None
 
-        if self.frame_count > 0:
-            avg_inference = (self.total_time / self.frame_count) * 1000
-            fps = self.frame_count / self.total_time if self.total_time > 0 else 0
+            if frame_idx == 0 and bootstrap_bbox is None:
+                invisible_streak += 1
+                stale_frames += 1
+            else:
+                tracker_response = tracker.track(
+                    frame_idx,
+                    packet.rgb_image,
+                    bootstrap_bbox_xyxy=bootstrap_bbox,
+                )
+                pose_latency_ms += float(tracker_response.get("latency_ms", 0.0) or 0.0)
+                bbox_bootstrap_used = bool(
+                    tracker_response.get("bbox_bootstrap_used", False)
+                )
+                mask_available = bool(tracker_response.get("mask_available", False))
+                tracker_logit_max = tracker_response.get("tracker_logit_max")
+                tracker_threshold = tracker_response.get("tracker_threshold")
+                if mask_available:
+                    pred_mask = tracker_response["mask"]
+                    last_prompt_bbox = tuple(
+                        int(v) for v in tracker_response["mask_bbox_xyxy"]
+                    )
+                    invisible_streak = 0
+                else:
+                    invisible_streak += 1
 
-            print(f"Total frames: {self.frame_count}")
-            print(f"Average inference time: {avg_inference:.1f}ms")
-            print(f"Inference FPS: {fps:.1f}")
+                if (
+                    not mask_available
+                    and bool(config.enable_bbox_reseed)
+                    and frame_idx > 0
+                    and last_prompt_bbox is not None
+                ):
+                    bbox_reseed_requested = True
+                    reseed_bbox = expand_bbox(
+                        last_prompt_bbox,
+                        max(int(config.prompt_bbox_pad_px) * 3, 64),
+                        int(config.image_width),
+                        int(config.image_height),
+                    )
+                    tracker_response = tracker.track(
+                        frame_idx,
+                        packet.rgb_image,
+                        reseed_bbox_xyxy=reseed_bbox,
+                    )
+                    pose_latency_ms += float(
+                        tracker_response.get("latency_ms", 0.0) or 0.0
+                    )
+                    bbox_reseed_used = bool(
+                        tracker_response.get("bbox_reseed_used", False)
+                    )
+                    mask_available = bool(tracker_response.get("mask_available", False))
+                    tracker_logit_max = tracker_response.get("tracker_logit_max")
+                    tracker_threshold = tracker_response.get("tracker_threshold")
+                    if mask_available:
+                        pred_mask = tracker_response["mask"]
+                        last_prompt_bbox = tuple(
+                            int(v) for v in tracker_response["mask_bbox_xyxy"]
+                        )
+                        invisible_streak = 0
 
-            if self.pose_errors:
-                dx_vals = [e["dx"] for e in self.pose_errors]
-                dy_vals = [e["dy"] for e in self.pose_errors]
-                dyaw_vals = [e["dyaw"] for e in self.pose_errors]
+                if mask_available and pred_mask is not None:
+                    if gt_target_mask is not None:
+                        mask_iou_value = float(mask_iou(gt_target_mask, pred_mask))
+                    pose_start = time.time()
+                    pose_prediction = pose_estimator.estimate_pose(
+                        packet.rgb_image,
+                        pred_mask.astype(np.uint8),
+                    )
+                    pose_latency_ms += (time.time() - pose_start) * 1000.0
+                    used_pose = {
+                        "dx_m": float(pose_prediction["dx_m"]),
+                        "dy_m": float(pose_prediction["dy_m"]),
+                        "yaw_follow_deg": float(pose_prediction["yaw_follow_deg"]),
+                    }
+                    pose_available = True
+                    pose_stale = False
+                    stale_frames = 0
+                    last_pose = dict(used_pose)
+                else:
+                    stale_frames += 1
 
-                print("\nPose predictions:")
-                print(f"  Mean dx: {np.mean(dx_vals):.3f}m")
-                print(f"  Mean dy: {np.mean(dy_vals):.3f}m")
-                print(f"  Mean dyaw: {np.mean(dyaw_vals):.2f}°")
+            if not pose_available and last_pose is not None:
+                if stale_frames <= int(config.max_pose_hold_frames):
+                    used_pose = dict(last_pose)
+                    pose_available = True
+                    pose_stale = True
+                else:
+                    used_pose = None
 
-                # Compute errors vs GT if available
-                gt_available = [
-                    e for e in self.pose_errors if e.get("gt_dx") is not None]
-                if gt_available:
-                    err_dx = [e["dx"] - e["gt_dx"] for e in gt_available]
-                    err_dy = [e["dy"] - e["gt_dy"] for e in gt_available]
-                    err_dyaw = [e["dyaw"] - e["gt_dyaw"] for e in gt_available]
+            if used_pose is None:
+                control = ControlCommand(throttle=0.0, steer=0.0, brake=0.4)
+            else:
+                control = controller.compute_control(
+                    TargetPose(
+                        dx_m=float(used_pose["dx_m"]),
+                        dy_m=float(used_pose["dy_m"]),
+                        yaw_follow_deg=float(used_pose["yaw_follow_deg"]),
+                        target_speed_mps=float(target_state["speed_mps"]),
+                    ),
+                    VehicleState(
+                        speed_mps=float(ego_state["speed_mps"]),
+                        throttle=float(ego_state["throttle"]),
+                        steer=float(ego_state["steer"]),
+                        brake=float(ego_state["brake"]),
+                    ),
+                )
 
-                    print(
-                        f"\nPose errors vs ground truth ({
-                            len(gt_available)} frames):")
-                    print(f"  MAE dx: {np.mean(np.abs(err_dx)):.3f}m")
-                    print(f"  MAE dy: {np.mean(np.abs(err_dy)):.3f}m")
-                    print(f"  MAE dyaw: {np.mean(np.abs(err_dyaw)):.2f}°")
-                    print(
-                        f"  RMSE dx: {
-                            np.sqrt(
-                                np.mean(
-                                    np.square(err_dx))):.3f}m")
-                    print(
-                        f"  RMSE dy: {
-                            np.sqrt(
-                                np.mean(
-                                    np.square(err_dy))):.3f}m")
+            metrics.add_row(
+                build_frame_metrics_row(
+                    config=config,
+                    frame_idx=frame_idx,
+                    tick=packet.tick,
+                    gt_pose=gt_pose,
+                    used_pose=used_pose,
+                    pose_available=pose_available,
+                    pose_stale=pose_stale,
+                    pose_latency_ms=pose_latency_ms,
+                    mask_iou=mask_iou_value,
+                    mask_available=mask_available,
+                    bbox_bootstrap_used=bbox_bootstrap_used,
+                    bbox_reseed_requested=bbox_reseed_requested,
+                    bbox_reseed_used=bbox_reseed_used,
+                    tracker_logit_max=tracker_logit_max,
+                    tracker_threshold=tracker_threshold,
+                    ego_state=ego_state,
+                    target_state=target_state,
+                    ego_world_state=ego_world_state,
+                    command_throttle=control.throttle,
+                    command_steer=control.steer,
+                    command_brake=control.brake,
+                    offroad=offroad,
+                    ego_collision_events=ego_collision_events,
+                    target_collision_events=target_collision_events,
+                    ego_lane_invasions_total=scenario.ego_events.total_lane_invasions,
+                    ego_collisions_total=scenario.ego_events.total_collisions,
+                    target_lane_invasions_total=scenario.target_events.total_lane_invasions,
+                    target_collisions_total=scenario.target_events.total_collisions,
+                    absolute_distance_m=absolute_distance_m,
+                )
+            )
 
-            if self.config.save_video:
-                print(f"\nEgo images saved to: {self.ego_output_dir}")
-                print(
-                    f"Spectator images saved to: {
-                        self.spectator_output_dir}")
+            scenario.apply_control(
+                control.throttle,
+                control.steer,
+                control.brake,
+            )
+            _save_spectator_frame(config, frame_idx, packet.spectator_image)
+            _save_ego_debug_frame(
+                config,
+                frame_idx,
+                packet.rgb_image,
+                pred_mask,
+                used_pose,
+                gt_pose,
+                control,
+            )
 
-        print("=" * 60)
+            lost_condition = (
+                absolute_distance_m >= float(config.lost_distance_m)
+                or (
+                    float(ego_state["speed_mps"])
+                    < float(config.lost_ego_stationary_speed_mps)
+                    and float(target_state["speed_mps"])
+                    > float(config.lost_target_speed_mps)
+                )
+            )
+            lost_streak = lost_streak + 1 if lost_condition else 0
 
-    def cleanup(self) -> None:
-        """Cleanup resources."""
-        print("\n[Cleanup] Cleaning up...")
+            if ego_collision_events > 0:
+                completion_reason = "ego_collision"
+                break
+            if target_collision_events > 0:
+                completion_reason = "target_collision"
+                break
+            if offroad_streak >= int(config.ego_offroad_breach_frames):
+                completion_reason = "ego_left_driving_lane"
+                break
+            if invisible_streak >= int(config.target_out_of_view_breach_frames):
+                completion_reason = "target_out_of_view"
+                break
+            if lost_streak >= int(config.lost_patience_frames):
+                completion_reason = "ego_lost_target"
+                break
+    finally:
+        scenario.cleanup()
 
-        # Destroy sensors
-        if self.sensor_manager is not None:
-            self.sensor_manager.destroy()
-
-        # Destroy spectator camera
-        if self.spectator_manager is not None:
-            self.spectator_manager.destroy()
-
-        # Destroy vehicles
-        actors_to_destroy = []
-        if self.ego is not None:
-            actors_to_destroy.append(self.ego)
-        actors_to_destroy.extend(self.targets)
-
-        cleanup_actors(actors_to_destroy)
-        print("[Cleanup] Vehicles destroyed")
-
-        # Reset world settings
-        if self.world is not None:
-            settings = self.world.get_settings()
-            settings.synchronous_mode = False
-            self.world.apply_settings(settings)
-
-        print("[Cleanup] Complete")
+    summary_path = metrics.write(completion_reason)
+    fps = 10.0
+    if float(config.fixed_delta_seconds) > 1e-6:
+        fps = 1.0 / float(config.fixed_delta_seconds)
+    ego_video_path = None
+    spectator_video_path = None
+    if bool(config.save_debug_images):
+        ego_video_path = _build_video(config.ego_frames_dir, config.ego_video_path, fps)
+    if bool(config.enable_spectator_camera):
+        spectator_video_path = _build_video(
+            config.spectator_frames_dir,
+            config.spectator_video_path,
+            fps,
+        )
+    _write_artifact_summary(
+        summary_path,
+        ego_video_path=ego_video_path,
+        spectator_video_path=spectator_video_path,
+    )
+    return summary_path
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse command line arguments.
-
-    Returns:
-        Parsed arguments.
-    """
     parser = argparse.ArgumentParser(
-        description="Vehicle pursuit using pose estimation and MPC control"
+        description="Run SAM3 + CNN + MPC target-specific pursuit inference",
     )
-
+    parser.add_argument("--checkpoint-path", required=True)
+    parser.add_argument("--carla-host", default="localhost")
+    parser.add_argument("--carla-port", type=int, default=2150)
+    parser.add_argument("--town", default="Town02")
+    parser.add_argument("--random-seed", type=int, default=7)
+    parser.add_argument("--num-frames", type=int, default=300)
+    parser.add_argument("--output-dir", default=os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "inference_output",
+    ))
+    parser.add_argument("--run-name", default="")
+    parser.add_argument("--desired-distance", type=float, default=8.0)
+    parser.add_argument("--num-background-vehicles", type=int, default=20)
+    parser.add_argument("--initial-target-distance", type=float, default=12.0)
+    parser.add_argument("--ego-initial-speed", type=float, default=0.0)
+    parser.add_argument("--target-speed-difference", type=float, default=80.0)
+    parser.add_argument("--sam3-device", default="cuda:0")
+    parser.add_argument("--pose-device", default="cuda:0")
     parser.add_argument(
-        "--checkpoint",
-        type=str,
-        default=(
-            "/usr/prakt/s0050/ravp/target_pose_runs/"
-            "target_pose_regressor_gt/best.pt"
-        ),
-        help="Path to model checkpoint",
-    )
-
-    parser.add_argument(
-        "--carla-host",
-        type=str,
-        default="localhost",
-        help="CARLA server host",
-    )
-
-    parser.add_argument(
-        "--carla-port",
+        "--bootstrap-bbox",
         type=int,
-        default=2150,
-        help="CARLA server port",
+        nargs=4,
+        metavar=("X1", "Y1", "X2", "Y2"),
+        default=None,
+        help="Optional first-frame target bbox in xyxy format.",
     )
-
     parser.add_argument(
-        "--town",
-        type=str,
-        default="Town04",
-        help="CARLA town to use",
-    )
-
-    parser.add_argument(
-        "--num-targets",
-        type=int,
-        default=3,
-        help="Number of target vehicles to spawn",
-    )
-
-    parser.add_argument(
-        "--num-frames",
-        type=int,
-        default=2000,
-        help="Number of frames to run the pursuit",
-    )
-
-    parser.add_argument(
-        "--desired-distance",
-        type=float,
-        default=3.0,
-        help="Desired following distance in meters",
-    )
-
-    parser.add_argument(
-        "--not-save-images",
+        "--no-projected-bootstrap",
         action="store_true",
-        help="Save images from ego and spectator cameras",
+        help="Disable the simulator-projected frame-0 bootstrap box.",
     )
-
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="/usr/prakt/s0050/ravp/inference_output",
-        help="Directory to save output images",
-    )
-
+    parser.add_argument("--save-debug-images", action="store_true")
+    parser.add_argument("--save-tracking-masks", action="store_true")
+    parser.add_argument("--no-spectator-camera", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
-    """Main entry point."""
     args = parse_args()
-
-    # Create config
-    config = InferenceConfig()
-
-    # Override from command line
-    config.checkpoint_path = args.checkpoint
-    config.carla_host = args.carla_host
-    config.carla_port = args.carla_port
-    config.town = args.town
-    config.num_target_vehicles = args.num_targets
-    config.num_frames = args.num_frames
-    config.desired_distance = args.desired_distance
-    config.save_video = not args.not_save_images
-    config.video_output_dir = args.output_dir
-
-    # Create pursuit instance
-    pursuit = VehiclePursuit(config)
-
-    try:
-        pursuit.setup()
-        pursuit.run()
-    finally:
-        pursuit.cleanup()
+    config = InferenceConfig(
+        checkpoint_path=args.checkpoint_path,
+        carla_host=args.carla_host,
+        carla_port=args.carla_port,
+        town=args.town,
+        random_seed=args.random_seed,
+        num_frames=args.num_frames,
+        output_dir=args.output_dir,
+        run_name=args.run_name,
+        desired_distance_m=args.desired_distance,
+        num_background_vehicles=args.num_background_vehicles,
+        initial_target_distance_m=args.initial_target_distance,
+        ego_initial_speed_mps=args.ego_initial_speed,
+        target_speed_difference_pct=args.target_speed_difference,
+        sam3_device=args.sam3_device,
+        pose_device=args.pose_device,
+        bootstrap_bbox_xyxy=(
+            tuple(args.bootstrap_bbox) if args.bootstrap_bbox is not None else None
+        ),
+        bootstrap_with_projected_bbox=not args.no_projected_bootstrap,
+        save_debug_images=args.save_debug_images,
+        save_tracking_masks=args.save_tracking_masks,
+        enable_spectator_camera=not args.no_spectator_camera,
+    )
+    summary_path = run_pursuit(config)
+    print(summary_path)
 
 
 if __name__ == "__main__":

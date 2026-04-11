@@ -1,4 +1,4 @@
-"""Utility helpers for the compact CARLA dataset pipeline."""
+"""Utility helpers for the CARLA dataset pipeline."""
 
 from __future__ import annotations
 

@@ -20,7 +20,10 @@ class PoseEstimator:
 
     def __init__(self, config: InferenceConfig):
         self.config = config
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        requested_device = getattr(config, "pose_device", "cuda:0")
+        if str(requested_device).startswith("cuda") and not torch.cuda.is_available():
+            requested_device = "cpu"
+        self.device = torch.device(requested_device)
 
         checkpoint = torch.load(
             config.checkpoint_path,
@@ -35,6 +38,8 @@ class PoseEstimator:
 
         self.model = TargetPoseRegressor(model_config).to(self.device)
         self.model.load_state_dict(checkpoint["model_state"])
+        if getattr(model_config, "channels_last", False):
+            self.model = self.model.to(memory_format=torch.channels_last)
         self.model.eval()
 
     @torch.no_grad()
@@ -50,10 +55,12 @@ class PoseEstimator:
         yaw_follow_deg = decoded["yaw_follow_deg"]
 
         return {
+            "dx_m": float(translation[0, 0].item()),
+            "dy_m": float(translation[0, 1].item()),
+            "yaw_follow_deg": float(yaw_follow_deg[0].item()),
             "dx": float(translation[0, 0].item()),
             "dy": float(translation[0, 1].item()),
             "dyaw": float(yaw_follow_deg[0].item()),
-            "yaw_follow_deg": float(yaw_follow_deg[0].item()),
         }
 
     def preprocess(
@@ -73,9 +80,14 @@ class PoseEstimator:
             crop_size=self.model_config.crop_size,
             crop_context_scale=self.model_config.crop_context_scale,
         )
+        full_input = full_input.unsqueeze(0)
+        crop_input = crop_input.unsqueeze(0)
+        if getattr(self.model_config, "channels_last", False):
+            full_input = full_input.contiguous(memory_format=torch.channels_last)
+            crop_input = crop_input.contiguous(memory_format=torch.channels_last)
         return (
-            full_input.unsqueeze(0).to(self.device),
-            crop_input.unsqueeze(0).to(self.device),
+            full_input.to(self.device),
+            crop_input.to(self.device),
             geometry.unsqueeze(0).to(self.device),
         )
 

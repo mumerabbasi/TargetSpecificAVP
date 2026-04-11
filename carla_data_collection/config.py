@@ -1,4 +1,4 @@
-"""Configuration for the compact single-pass CARLA dataset pipeline."""
+"""Configuration for the single-pass CARLA dataset pipeline."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ class Config:
 
     1. capture synchronized CARLA sensors in memory,
     2. run SAM3 and the 3D detector immediately,
-    3. write only final RGB, masks, CSVs, and a compact frame manifest.
+    3. write only final RGB, masks, CSVs, and a frame manifest.
     """
 
     # ------------------------------------------------------------------

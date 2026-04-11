@@ -1,4 +1,4 @@
-"""Clean CARLA scenario runtime for pursuit evaluation."""
+"""CARLA runtime for target-specific pursuit inference."""
 
 from __future__ import annotations
 
@@ -11,11 +11,12 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import carla
 import numpy as np
 
-from .config import PursuitEvalConfig
+from .config import InferenceConfig
 from .geometry import (
     bbox_from_mask,
     bbox_iou,
     get_camera_intrinsic,
+    project_world_points_to_image,
     wrap_angle_deg,
 )
 
@@ -42,14 +43,9 @@ def _parse_instance(image: carla.Image) -> np.ndarray:
     return array.reshape((image.height, image.width, 4)).copy()
 
 
-def _parse_lidar(meas: carla.LidarMeasurement) -> np.ndarray:
-    data = np.frombuffer(meas.raw_data, dtype=np.float32)
-    points = data.reshape((-1, 4))
-    return points.copy()
-
-
 def _preferred_vehicle_blueprints(
-        bp_lib: carla.BlueprintLibrary) -> List[carla.ActorBlueprint]:
+    bp_lib: carla.BlueprintLibrary,
+) -> List[carla.ActorBlueprint]:
     vehicles = [
         bp
         for bp in bp_lib.filter("vehicle.*")
@@ -89,9 +85,10 @@ def _random_blueprint(
     return blueprint
 
 
-def compute_relative_pose(
-        ego: carla.Vehicle, target: carla.Vehicle) -> Dict[str, float]:
-    """Compute target pose in ego coordinates."""
+def _compute_relative_pose(
+    ego: carla.Vehicle,
+    target: carla.Vehicle,
+) -> Dict[str, float]:
     ego_tf = ego.get_transform()
     target_tf = target.get_transform()
     dx_world = target_tf.location.x - ego_tf.location.x
@@ -109,14 +106,12 @@ def compute_relative_pose(
     }
 
 
-def get_vehicle_speed(vehicle: carla.Vehicle) -> float:
-    """Return Euclidean speed in m/s."""
+def _get_vehicle_speed(vehicle: carla.Vehicle) -> float:
     velocity = vehicle.get_velocity()
     return math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2)
 
 
 def ego_on_driving_lane(world: carla.World, ego: carla.Vehicle) -> bool:
-    """Check whether ego is still on a driving lane."""
     waypoint = world.get_map().get_waypoint(
         ego.get_location(),
         project_to_road=False,
@@ -154,40 +149,11 @@ def follow_friendly_waypoint_chain(
         if current.is_junction:
             return False
         yaw_delta = abs(
-            float(
-                wrap_angle_deg(
-                    current.transform.rotation.yaw -
-                    start_yaw)))
+            float(wrap_angle_deg(current.transform.rotation.yaw - start_yaw))
+        )
         if yaw_delta > float(max_yaw_delta_deg):
             return False
     return True
-
-
-def project_world_points_to_image(
-    world_points_xyz: np.ndarray,
-    camera_world_matrix: np.ndarray,
-    intrinsic: np.ndarray,
-    image_width: int,
-    image_height: int,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Project world points into image coordinates."""
-    camera_inv = np.linalg.inv(camera_world_matrix)
-    points_h = np.hstack(
-        [world_points_xyz[:, :3], np.ones((world_points_xyz.shape[0], 1))])
-    points_cam = (camera_inv @ points_h.T).T
-    x_cam = points_cam[:, 1]
-    y_cam = -points_cam[:, 2]
-    z_cam = points_cam[:, 0]
-    valid_depth = z_cam > 0.1
-    u = intrinsic[0, 0] * x_cam / np.maximum(z_cam, 1e-6) + intrinsic[0, 2]
-    v = intrinsic[1, 1] * y_cam / np.maximum(z_cam, 1e-6) + intrinsic[1, 2]
-    valid_bounds = (
-        (u >= 0.0)
-        & (u < float(image_width))
-        & (v >= 0.0)
-        & (v < float(image_height))
-    )
-    return np.stack([u, v], axis=1), valid_depth & valid_bounds
 
 
 @dataclass
@@ -197,48 +163,98 @@ class SensorPacket:
     tick: int
     rgb_image: np.ndarray
     instance_image: np.ndarray
-    lidar_points: np.ndarray
     spectator_image: Optional[np.ndarray] = None
 
 
+class VehicleEventMonitor:
+    """Lane invasion and collision counters for one vehicle."""
+
+    def __init__(
+        self,
+        world: carla.World,
+        vehicle: carla.Vehicle,
+    ) -> None:
+        self.world = world
+        self.vehicle = vehicle
+        self.total_lane_invasions = 0
+        self.total_collisions = 0
+        self._collision_actor_ids: set[int] = set()
+        self._frame_collision_events: List[carla.CollisionEvent] = []
+
+        bp_lib = world.get_blueprint_library()
+        lane_bp = bp_lib.find("sensor.other.lane_invasion")
+        collision_bp = bp_lib.find("sensor.other.collision")
+        self.lane_sensor = world.spawn_actor(
+            lane_bp,
+            carla.Transform(),
+            attach_to=vehicle,
+        )
+        self.collision_sensor = world.spawn_actor(
+            collision_bp,
+            carla.Transform(),
+            attach_to=vehicle,
+        )
+        self.lane_sensor.listen(self._on_lane_invasion)
+        self.collision_sensor.listen(self._on_collision)
+
+    def _on_lane_invasion(self, event: carla.LaneInvasionEvent) -> None:
+        self.total_lane_invasions += 1
+
+    def _on_collision(self, event: carla.CollisionEvent) -> None:
+        self._frame_collision_events.append(event)
+        other_actor = getattr(event, "other_actor", None)
+        other_actor_id = int(other_actor.id) if other_actor is not None else -1
+        if other_actor_id not in self._collision_actor_ids:
+            self._collision_actor_ids.add(other_actor_id)
+            self.total_collisions += 1
+
+    def consume_collision_events(self) -> int:
+        count = len(self._frame_collision_events)
+        self._frame_collision_events[:] = []
+        return count
+
+    def reset_counters(self) -> None:
+        self.total_lane_invasions = 0
+        self.total_collisions = 0
+        self._collision_actor_ids.clear()
+        self._frame_collision_events[:] = []
+
+    def destroy(self) -> None:
+        for sensor in (self.lane_sensor, self.collision_sensor):
+            if sensor is None:
+                continue
+            try:
+                sensor.stop()
+            except RuntimeError:
+                pass
+        destroy_actors([self.lane_sensor, self.collision_sensor])
+
+
 class EgoSensorSuite:
-    """RGB, instance, lidar, and collision sensors attached to the ego car."""
+    """RGB and instance segmentation sensors attached to the ego car."""
 
     vehicle_semantic_tag = 14
 
     def __init__(
-            self,
-            world: carla.World,
-            ego: carla.Vehicle,
-            config: PursuitEvalConfig) -> None:
+        self,
+        world: carla.World,
+        ego: carla.Vehicle,
+        config: InferenceConfig,
+    ) -> None:
         self.world = world
         self.ego = ego
         self.config = config
-        self.rgb_queue = queue.Queue()
-        self.instance_queue = queue.Queue()
-        self.lidar_queue = queue.Queue()
-        self.collision_events: List[carla.CollisionEvent] = []
+        self.rgb_queue: "queue.Queue[carla.Image]" = queue.Queue()
+        self.instance_queue: "queue.Queue[carla.Image]" = queue.Queue()
 
         bp_lib = world.get_blueprint_library()
         self.camera_transform = carla.Transform(
             carla.Location(
                 x=config.camera_x_m,
                 y=config.camera_y_m,
-                z=config.camera_z_m),
-            carla.Rotation(
-                pitch=0.0,
-                yaw=0.0,
-                roll=0.0),
-        )
-        self.lidar_transform = carla.Transform(
-            carla.Location(
-                x=config.lidar_x_m,
-                y=config.lidar_y_m,
-                z=config.lidar_z_m),
-            carla.Rotation(
-                pitch=0.0,
-                yaw=0.0,
-                roll=0.0),
+                z=config.camera_z_m,
+            ),
+            carla.Rotation(pitch=0.0, yaw=0.0, roll=0.0),
         )
 
         rgb_bp = bp_lib.find("sensor.camera.rgb")
@@ -251,124 +267,86 @@ class EgoSensorSuite:
         instance_bp.set_attribute("image_size_y", str(config.image_height))
         instance_bp.set_attribute("fov", str(config.fov))
 
-        lidar_bp = bp_lib.find("sensor.lidar.ray_cast")
-        lidar_bp.set_attribute("range", str(config.lidar_range_m))
-        lidar_bp.set_attribute(
-            "rotation_frequency", str(
-                config.lidar_rotation_frequency_hz))
-        lidar_bp.set_attribute(
-            "points_per_second", str(
-                config.lidar_points_per_second))
-        lidar_bp.set_attribute("channels", str(config.lidar_channels))
-        lidar_bp.set_attribute("upper_fov", str(config.lidar_upper_fov_deg))
-        lidar_bp.set_attribute("lower_fov", str(config.lidar_lower_fov_deg))
-        lidar_bp.set_attribute("dropoff_general_rate", "0.0")
-        lidar_bp.set_attribute("dropoff_intensity_limit", "1.0")
-        lidar_bp.set_attribute("dropoff_zero_intensity", "0.0")
-
-        collision_bp = bp_lib.find("sensor.other.collision")
-
         self.rgb_camera = world.spawn_actor(
-            rgb_bp, self.camera_transform, attach_to=ego)
+            rgb_bp,
+            self.camera_transform,
+            attach_to=ego,
+        )
         self.instance_camera = world.spawn_actor(
-            instance_bp, self.camera_transform, attach_to=ego)
-        self.lidar_sensor = world.spawn_actor(
-            lidar_bp, self.lidar_transform, attach_to=ego)
-        self.collision_sensor = world.spawn_actor(
-            collision_bp, carla.Transform(), attach_to=ego)
-
+            instance_bp,
+            self.camera_transform,
+            attach_to=ego,
+        )
         self.rgb_camera.listen(self.rgb_queue.put)
         self.instance_camera.listen(self.instance_queue.put)
-        self.lidar_sensor.listen(self.lidar_queue.put)
-        self.collision_sensor.listen(self.collision_events.append)
 
         self.intrinsic = get_camera_intrinsic(
-            config.image_width, config.image_height, config.fov)
+            config.image_width,
+            config.image_height,
+            config.fov,
+        )
 
     def destroy(self) -> None:
-        sensors = [
-            self.rgb_camera,
-            self.instance_camera,
-            self.lidar_sensor,
-            self.collision_sensor,
-        ]
-        for sensor in sensors:
+        for sensor in (self.rgb_camera, self.instance_camera):
             if sensor is None:
                 continue
             try:
                 sensor.stop()
             except RuntimeError:
                 pass
-        destroy_actors(sensors)
+        destroy_actors([self.rgb_camera, self.instance_camera])
 
     def clear_queues(self) -> None:
-        for q in (self.rgb_queue, self.instance_queue, self.lidar_queue):
-            while not q.empty():
+        for sensor_queue in (self.rgb_queue, self.instance_queue):
+            while not sensor_queue.empty():
                 try:
-                    q.get_nowait()
+                    sensor_queue.get_nowait()
                 except queue.Empty:
                     break
-
-    def warmup(self, ticks: int) -> None:
-        for _ in range(int(ticks)):
-            self.world.tick()
-            self.clear_queues()
-            self.collision_events[:] = []
 
     def get_packet(self, timeout: float = 2.0) -> SensorPacket:
         packets = {
             "rgb": self.rgb_queue.get(timeout=timeout),
             "instance": self.instance_queue.get(timeout=timeout),
-            "lidar": self.lidar_queue.get(timeout=timeout),
         }
 
         while True:
-            frame_ids = {name: int(packet.frame)
-                         for name, packet in packets.items()}
+            frame_ids = {
+                name: int(packet.frame)
+                for name, packet in packets.items()
+            }
             if len(set(frame_ids.values())) == 1:
                 break
 
             target_frame = max(frame_ids.values())
             for name, packet in list(packets.items()):
                 if int(packet.frame) < target_frame:
-                    packets[name] = getattr(
-                        self,
-                        name +
-                        "_queue").get(
-                        timeout=timeout)
+                    packets[name] = getattr(self, f"{name}_queue").get(
+                        timeout=timeout
+                    )
 
         return SensorPacket(
             tick=int(packets["rgb"].frame),
             rgb_image=_parse_rgb(packets["rgb"]),
             instance_image=_parse_instance(packets["instance"]),
-            lidar_points=_parse_lidar(packets["lidar"]),
         )
-
-    def consume_collision_events(self) -> int:
-        count = len(self.collision_events)
-        self.collision_events[:] = []
-        return count
 
     def camera_world_matrix(self) -> np.ndarray:
         return np.asarray(
             self.rgb_camera.get_transform().get_matrix(),
-            dtype=np.float64)
-
-    def lidar_world_matrix(self) -> np.ndarray:
-        return np.asarray(
-            self.lidar_sensor.get_transform().get_matrix(),
-            dtype=np.float64)
-
-    def lidar_to_camera_matrix(self) -> np.ndarray:
-        camera_inv = np.linalg.inv(self.camera_world_matrix())
-        return camera_inv @ self.lidar_world_matrix()
+            dtype=np.float64,
+        )
 
     def project_actor_bbox(
-            self, actor: carla.Vehicle) -> Optional[Tuple[int, int, int, int]]:
+        self,
+        actor: carla.Vehicle,
+    ) -> Optional[Tuple[int, int, int, int]]:
         bbox = actor.bounding_box
         vertices = bbox.get_world_vertices(actor.get_transform())
-        world_points = np.array([[v.x, v.y, v.z]
-                                for v in vertices], dtype=np.float64)
+        world_points = np.array(
+            [[vertex.x, vertex.y, vertex.z] for vertex in vertices],
+            dtype=np.float64,
+        )
         uv, valid = project_world_points_to_image(
             world_points,
             self.camera_world_matrix(),
@@ -378,23 +356,36 @@ class EgoSensorSuite:
         )
         if valid.sum() < 4:
             return None
+
         uv_valid = uv[valid]
         x1 = int(
             np.clip(
                 np.floor(uv_valid[:, 0].min()),
-                0, self.config.image_width - 1))
+                0,
+                self.config.image_width - 1,
+            )
+        )
         y1 = int(
             np.clip(
                 np.floor(uv_valid[:, 1].min()),
-                0, self.config.image_height - 1))
+                0,
+                self.config.image_height - 1,
+            )
+        )
         x2 = int(
             np.clip(
                 np.ceil(uv_valid[:, 0].max()),
-                0, self.config.image_width - 1))
+                0,
+                self.config.image_width - 1,
+            )
+        )
         y2 = int(
             np.clip(
                 np.ceil(uv_valid[:, 1].max()),
-                0, self.config.image_height - 1))
+                0,
+                self.config.image_height - 1,
+            )
+        )
         if x2 <= x1 or y2 <= y1:
             return None
         return (x1, y1, x2, y2)
@@ -429,18 +420,18 @@ class EgoSensorSuite:
             if score > best_iou:
                 best_iou = score
                 best_mask = mask
-
         return best_mask
 
 
 class TargetSpectatorCamera:
-    """Overhead RGB camera attached to the target for qualitative evaluation."""
+    """Overhead spectator camera attached to the target vehicle."""
 
     def __init__(
-            self,
-            world: carla.World,
-            target: carla.Vehicle,
-            config: PursuitEvalConfig) -> None:
+        self,
+        world: carla.World,
+        target: carla.Vehicle,
+        config: InferenceConfig,
+    ) -> None:
         self.world = world
         self.target = target
         self.config = config
@@ -492,7 +483,7 @@ class TargetSpectatorCamera:
 class PursuitScenario:
     """CARLA pursuit scenario containing ego, target, traffic, and sensors."""
 
-    def __init__(self, config: PursuitEvalConfig) -> None:
+    def __init__(self, config: InferenceConfig) -> None:
         self.config = config
         self.client: Optional[carla.Client] = None
         self.world: Optional[carla.World] = None
@@ -501,15 +492,18 @@ class PursuitScenario:
         self.target: Optional[carla.Vehicle] = None
         self.background_vehicles: List[carla.Vehicle] = []
         self.sensors: Optional[EgoSensorSuite] = None
+        self.ego_events: Optional[VehicleEventMonitor] = None
+        self.target_events: Optional[VehicleEventMonitor] = None
         self.spectator_camera: Optional[TargetSpectatorCamera] = None
-        self._spawned_actors: List[object] = []
 
     def setup(self) -> None:
         random.seed(int(self.config.random_seed))
         np.random.seed(int(self.config.random_seed))
+
         self.client = carla.Client(
             self.config.carla_host,
-            self.config.carla_port)
+            self.config.carla_port,
+        )
         self.client.set_timeout(float(self.config.client_timeout_s))
         self.world = self.client.load_world(self.config.town)
         for _ in range(15):
@@ -521,11 +515,9 @@ class PursuitScenario:
         self.world.apply_settings(settings)
         self.world.set_weather(carla.WeatherParameters.ClearNoon)
 
-        self.traffic_manager = self.client.get_trafficmanager(
-            int(self.config.tm_port))
+        self.traffic_manager = self.client.get_trafficmanager(int(self.config.tm_port))
         try:
-            self.traffic_manager.set_random_device_seed(
-                int(self.config.random_seed))
+            self.traffic_manager.set_random_device_seed(int(self.config.random_seed))
         except RuntimeError:
             pass
         self.traffic_manager.set_synchronous_mode(bool(self.config.sync_mode))
@@ -542,21 +534,25 @@ class PursuitScenario:
             for _ in range(5):
                 self.world.tick()
 
-        self._spawn_ego_target_and_traffic()
+        self._spawn_ego_and_target()
         self.sensors = EgoSensorSuite(self.world, self.ego, self.config)
+        self.ego_events = VehicleEventMonitor(self.world, self.ego)
+        self.target_events = VehicleEventMonitor(self.world, self.target)
         if bool(self.config.enable_spectator_camera):
             self.spectator_camera = TargetSpectatorCamera(
-                self.world, self.target, self.config)
-        self._spawned_actors.extend([self.ego, self.target] +
-                                    list(self.background_vehicles) +
-                                    [self.sensors, self.spectator_camera])
+                self.world,
+                self.target,
+                self.config,
+            )
+
         self._warmup_sensors(self.config.warmup_ticks)
         self._start_target_autopilot()
         self.background_vehicles = self._spawn_background_traffic()
         if float(self.config.ego_initial_speed_mps) > 0.0:
-            self._set_ego_forward_speed(
-                float(self.config.ego_initial_speed_mps))
+            self._set_ego_forward_speed(float(self.config.ego_initial_speed_mps))
         self.world.tick()
+        self.ego_events.reset_counters()
+        self.target_events.reset_counters()
 
     def cleanup(self) -> None:
         if self.world is not None:
@@ -570,11 +566,18 @@ class PursuitScenario:
         if self.sensors is not None:
             self.sensors.destroy()
             self.sensors = None
+        if self.ego_events is not None:
+            self.ego_events.destroy()
+            self.ego_events = None
+        if self.target_events is not None:
+            self.target_events.destroy()
+            self.target_events = None
         if self.spectator_camera is not None:
             self.spectator_camera.destroy()
             self.spectator_camera = None
+
         actors = [self.ego, self.target] + list(self.background_vehicles)
-        actor_ids = []
+        actor_ids: List[int] = []
         for actor in actors:
             if actor is None:
                 continue
@@ -585,17 +588,18 @@ class PursuitScenario:
         if self.client is not None and actor_ids:
             try:
                 self.client.apply_batch(
-                    [carla.command.DestroyActor(actor_id)
-                     for actor_id in actor_ids])
+                    [carla.command.DestroyActor(actor_id) for actor_id in actor_ids]
+                )
             except RuntimeError:
                 pass
         else:
             destroy_actors(actors)
+
         self.background_vehicles = []
         self.ego = None
         self.target = None
 
-    def _spawn_ego_target_and_traffic(self) -> None:
+    def _spawn_ego_and_target(self) -> None:
         assert self.world is not None
         assert self.traffic_manager is not None
         bp_lib = self.world.get_blueprint_library()
@@ -609,13 +613,9 @@ class PursuitScenario:
                 if not follow_friendly_waypoint_chain(
                     carla_map,
                     spawn_point.location,
-                    lookahead_m=float(
-                        self.config.follow_spawn_lookahead_m,
-                    ),
+                    lookahead_m=float(self.config.follow_spawn_lookahead_m),
                     step_m=float(self.config.follow_spawn_step_m),
-                    max_yaw_delta_deg=float(
-                        self.config.follow_spawn_max_yaw_delta_deg,
-                    ),
+                    max_yaw_delta_deg=float(self.config.follow_spawn_max_yaw_delta_deg),
                 ):
                     continue
 
@@ -646,7 +646,8 @@ class PursuitScenario:
                 continue
 
             ahead_candidates = ego_waypoint.next(
-                float(self.config.initial_target_distance_m))
+                float(self.config.initial_target_distance_m)
+            )
             if not ahead_candidates:
                 destroy_actors([ego])
                 continue
@@ -656,9 +657,8 @@ class PursuitScenario:
                 carla.Location(
                     x=target_waypoint.transform.location.x,
                     y=target_waypoint.transform.location.y,
-                    z=target_waypoint.transform.location.z +
-                    float(
-                        self.config.target_spawn_z_offset_m),
+                    z=target_waypoint.transform.location.z
+                    + float(self.config.target_spawn_z_offset_m),
                 ),
                 target_waypoint.transform.rotation,
             )
@@ -672,8 +672,7 @@ class PursuitScenario:
             self.target = target
             return
 
-        raise RuntimeError(
-            "Failed to spawn a valid ego-target pair for pursuit evaluation.")
+        raise RuntimeError("Failed to spawn a valid ego-target pair for inference.")
 
     def _set_ego_forward_speed(self, speed_mps: float) -> None:
         assert self.ego is not None
@@ -730,13 +729,8 @@ class PursuitScenario:
 
             dist_ego = spawn_point.location.distance(ego_loc)
             dist_target = spawn_point.location.distance(target_loc)
-            exclusion_radius = float(
-                self.config.background_spawn_exclusion_radius_m,
-            )
-            if (
-                dist_ego < exclusion_radius
-                or dist_target < exclusion_radius
-            ):
+            exclusion_radius = float(self.config.background_spawn_exclusion_radius_m)
+            if dist_ego < exclusion_radius or dist_target < exclusion_radius:
                 continue
 
             blueprint = _random_blueprint(blueprints, "autopilot")
@@ -759,7 +753,8 @@ class PursuitScenario:
         for _ in range(int(ticks)):
             self.world.tick()
             self.sensors.clear_queues()
-            self.sensors.collision_events[:] = []
+            self.ego_events.consume_collision_events()
+            self.target_events.consume_collision_events()
             if self.spectator_camera is not None:
                 self.spectator_camera.clear_queue()
 
@@ -769,8 +764,7 @@ class PursuitScenario:
         self.world.tick()
         packet = self.sensors.get_packet()
         if self.spectator_camera is not None:
-            packet.spectator_image = self.spectator_camera.get_image(
-                packet.tick)
+            packet.spectator_image = self.spectator_camera.get_image(packet.tick)
         return packet
 
     @staticmethod
@@ -794,22 +788,44 @@ class PursuitScenario:
         control = self.ego.get_control()
         return {
             "speed_mps": math.sqrt(
-                velocity.x ** 2 +
-                velocity.y ** 2 +
-                velocity.z ** 2),
-            "throttle": float(
-                control.throttle),
-            "steer": float(
-                control.steer),
-            "brake": float(
-                control.brake),
+                velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2
+            ),
+            "throttle": float(control.throttle),
+            "steer": float(control.steer),
+            "brake": float(control.brake),
         }
 
-    def apply_control(
-            self,
-            throttle: float,
-            steer: float,
-            brake: float) -> None:
+    def target_vehicle_state(self) -> Dict[str, float]:
+        assert self.target is not None
+        velocity = self.target.get_velocity()
+        control = self.target.get_control()
+        transform = self.target.get_transform()
+        return {
+            "x_m": float(transform.location.x),
+            "y_m": float(transform.location.y),
+            "yaw_rad": math.radians(float(transform.rotation.yaw)),
+            "speed_mps": math.sqrt(
+                velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2
+            ),
+            "throttle": float(control.throttle),
+            "steer": float(control.steer),
+            "brake": float(control.brake),
+        }
+
+    def ego_world_state(self) -> Dict[str, float]:
+        assert self.ego is not None
+        velocity = self.ego.get_velocity()
+        transform = self.ego.get_transform()
+        return {
+            "x_m": float(transform.location.x),
+            "y_m": float(transform.location.y),
+            "yaw_rad": math.radians(float(transform.rotation.yaw)),
+            "speed_mps": math.sqrt(
+                velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2
+            ),
+        }
+
+    def apply_control(self, throttle: float, steer: float, brake: float) -> None:
         assert self.ego is not None
         self.ego.apply_control(
             carla.VehicleControl(
@@ -825,13 +841,26 @@ class PursuitScenario:
     def ground_truth_pose(self) -> Dict[str, float]:
         assert self.ego is not None
         assert self.target is not None
-        return compute_relative_pose(self.ego, self.target)
+        return _compute_relative_pose(self.ego, self.target)
 
     def target_speed(self) -> float:
         assert self.target is not None
-        return get_vehicle_speed(self.target)
+        return _get_vehicle_speed(self.target)
 
     def ego_offroad(self) -> bool:
         assert self.world is not None
         assert self.ego is not None
         return not ego_on_driving_lane(self.world, self.ego)
+
+    def absolute_distance(self) -> float:
+        assert self.ego is not None
+        assert self.target is not None
+        ego_loc = self.ego.get_location()
+        target_loc = self.target.get_location()
+        return float(
+            math.sqrt(
+                (ego_loc.x - target_loc.x) ** 2
+                + (ego_loc.y - target_loc.y) ** 2
+                + (ego_loc.z - target_loc.z) ** 2
+            )
+        )

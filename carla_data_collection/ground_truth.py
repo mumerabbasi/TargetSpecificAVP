@@ -1,4 +1,4 @@
-"""Ground-truth helpers for compact collection and reporting."""
+"""Ground-truth helpers for dataset collection and reporting."""
 
 from __future__ import annotations
 

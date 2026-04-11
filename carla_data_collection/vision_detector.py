@@ -1,4 +1,4 @@
-"""SAM3-based vehicle mask generation for compact dataset collection."""
+"""SAM3-based vehicle mask generation for dataset collection."""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ class VisionDetector:
             from sam3.model_builder import build_sam3_image_model
         except ImportError as exc:
             raise ImportError(
-                "sam3 must be importable in the compact collection "
+                "sam3 must be importable in the dataset collection "
                 "environment."
             ) from exc
 

@@ -168,7 +168,7 @@ def _json_ready(value: object) -> object:
 
 
 class DatasetWriter:
-    """Append-only compact dataset writer with manifest-based resume."""
+    """Append-only dataset writer with manifest-based resume."""
 
     def __init__(self, config: Config) -> None:
         self.config = config
@@ -673,7 +673,7 @@ def _attach_detector_predictions(
 
 
 def collect_dataset(config: Config) -> None:
-    """Run compact single-pass data collection and write the final dataset."""
+    """Run single-pass data collection and write the final dataset."""
     writer = DatasetWriter(config)
     mask_generator = VisionDetector(
         repo_path=config.sam3_repo_path,

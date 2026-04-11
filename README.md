@@ -2,8 +2,6 @@
 
 # Vision-Based Target-Specific Autonomous Vehicle Pursuit
 
-### Robust target-specific vehicle pursuit in CARLA
-
 Track and follow one designated target vehicle through traffic using a first-frame target prompt, SAM3 tracking, learned relative pose estimation, and MPC-based control of the ego vehicle.
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
@@ -57,7 +55,7 @@ The intended deployment flow is:
 
 This makes the system target-aware: the pursuit policy is conditioned on the tracked target mask, so two similar vehicles ahead do not look identical to the controller.
 
-For controlled CARLA evaluation, the current `pursuit_eval` harness bootstraps frame 0 using a simulator-projected target box by default. Conceptually, this is the same interface as a user-provided first-frame target prompt.
+For controlled CARLA evaluation, the current `inference.run_pursuit` harness bootstraps frame 0 using a simulator-projected target box by default. Conceptually, this is the same interface as a user-provided first-frame target prompt.
 
 The repo has two clearly separated layers:
 
@@ -149,7 +147,7 @@ In practice, the `dx`, `dy`, and `dyaw` errors from that PCA-based pose-labeling
 | Target pose training | **Implemented** |
 | End-to-end benchmark table | **In progress** |
 
-The repository already contains the full collection, training, and pursuit components. Final quantitative benchmark numbers should be reported from the saved training runs and pursuit-evaluation outputs.
+The repository already contains the full collection, training, and pursuit components. Final quantitative benchmark numbers should be reported from the saved training runs and closed-loop pursuit outputs.
 
 ---
 
@@ -168,22 +166,30 @@ The most important behavior is **identity consistency**. The target mask tells t
 
 To keep the project easy to reason about:
 
-- `pursuit_eval/` and `inference/` are the runtime pursuit side
+- `inference/` is the runtime pursuit side
 - `carla_data_collection/` and `target_pose_regression/` are the supporting dataset-generation and learning side
 
-The current CARLA evaluation harness lives in `pursuit_eval/` and supports detector-driven online pursuit with in-process SAM3 tracking and 3D detection.
+The current CARLA evaluation harness lives in `inference/` and runs the full online pursuit loop with first-frame target prompting, SAM3 tracking, CNN pose estimation, MPC control, and saved evaluation metrics.
 
 Example pursuit evaluation command:
 
 ```bash
-python -m pursuit_eval.run \
-    --pose-source detector \
+python -m inference.run_pursuit \
+    --checkpoint-path /my_workspace/Resume/RAVP/target_pose_runs/<run>/best.pt \
     --town Town02 \
     --carla-host localhost \
     --carla-port 2150 \
     --sam3-device cuda:0 \
-    --detector-device cuda:0
+    --pose-device cuda:0 \
+    --save-debug-images
 ```
+
+Each inference run writes:
+
+- `metrics.json` with pose, pursuit, and closed-loop summaries
+- `frames.jsonl` with per-frame logs
+- `closed_loop_report.txt` with completion, infraction, control-difference, and ATE metrics
+- optional `ego.mp4` and `spectator.mp4` videos when debug image saving is enabled
 
 ---
 
@@ -301,20 +307,14 @@ RAVP/
 │   ├── utils.py
 │   └── vision_detector.py
 ├── inference/
-│   ├── carla_utils.py
 │   ├── config.py
-│   ├── mpc_controller.py
-│   ├── pose_estimator.py
-│   └── run_pursuit.py
-├── pursuit_eval/
-│   ├── batch_run.py
-│   ├── config.py
-│   ├── controller.py
 │   ├── geometry.py
 │   ├── metrics.py
-│   ├── perception.py
-│   ├── run.py
-│   └── scenario.py
+│   ├── mpc_controller.py
+│   ├── pose_estimator.py
+│   ├── run_pursuit.py
+│   ├── scenario.py
+│   └── tracker.py
 ├── scripts/
 │   ├── start_carla_watchdog.sh
 │   ├── start_collect_train_towns.sh
