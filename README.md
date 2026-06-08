@@ -2,7 +2,7 @@
 
 # Vision-Based Target-Specific Autonomous Vehicle Pursuit
 
-An end-to-end CARLA research system for selecting one target vehicle, tracking it through traffic, estimating its relative pose, and controlling the ego vehicle to keep following that same target.
+An end-to-end CARLA research system for selecting one target vehicle, tracking it through traffic, estimating its ego-frame pose, and controlling the ego vehicle to keep following that same target.
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![PyTorch](https://img.shields.io/badge/PyTorch-Deep_Learning-EE4C2C?logo=pytorch&logoColor=white)
@@ -22,12 +22,12 @@ An end-to-end CARLA research system for selecting one target vehicle, tracking i
 
 TargetSpecificAVP solves a practical autonomous driving problem: **follow the selected car, not just whichever car is easiest to see**.
 
-The system starts from a first-frame target prompt, uses SAM3 to maintain a target mask, predicts the selected vehicle's relative pose from RGB plus mask inputs, and feeds that pose into an MPC controller for closed-loop pursuit. The supporting ML stack generates a per-target CARLA dataset and trains the ConvNeXt-based pose regressor used by the controller.
+The system starts from a first-frame target prompt, uses SAM3 to maintain a target mask, predicts the selected vehicle's ego-frame pose from RGB plus mask inputs, and feeds that pose into an MPC controller for closed-loop pursuit. The supporting ML stack collects CARLA data and trains the ConvNeXt-based pose regressor used by the controller.
 
 The project has two main contributions:
 
-1. **Target-specific AVP pipeline** - first-frame target selection, online mask tracking, learned relative pose estimation, and MPC control in CARLA.
-2. **Dataset and training pipeline** - CARLA data collection with LiDAR plus 3D-detector pose supervision for ConvNeXt pose-regressor training.
+1. **Target-specific AVP pipeline** - first-frame target selection, online mask tracking, learned ego-frame pose estimation, and MPC control in CARLA.
+2. **Pose-supervision and training pipeline** - CARLA data collection with LiDAR plus 3D detector labels for the target vehicle's ego-frame `dx`, `dy`, and `dyaw` pose supervision.
 
 Run the example commands below from the `TargetSpecificAVP/` directory.
 
@@ -37,25 +37,25 @@ Run the example commands below from the `TargetSpecificAVP/` directory.
 |:-----------|:-------|
 | Target identity persistence | **Follow one chosen car** instead of drifting to nearby traffic vehicles |
 | Prompted initialization | **Bootstrap from a target bbox in the first frame**, then hand off to online SAM3 tracking |
-| Target-specific perception | **Mask-conditioned pose estimation** predicts the selected car's `dx_m`, `dy_m`, and `yaw_follow_deg` |
+| Target-specific perception | **Mask-conditioned pose estimation** predicts the selected car's ego-frame `dx`, `dy`, and relative yaw |
 | Closed-loop control | **MPC pursuit controller** uses the estimated target pose to keep following distance and alignment |
 | Training setup | **ConvNeXt-based target pose learning** trained for the pursuit perception stack |
-| Dataset engine | **Large and diverse CARLA dataset generation** with LiDAR and 3D-detector-derived pose labels |
+| Dataset engine | **Large and diverse CARLA dataset generation** with LiDAR plus 3D detector labels for ego-frame pose supervision |
 | Alternate variant | Includes a **legacy stereo-depth perception variant** used in the current demo asset |
 
 ## Main Contributions
 
 **1. End-to-end target-specific pursuit**
 
-The runtime stack is built around target identity. A user or simulator prompt identifies the target vehicle in frame 0, SAM3 tracks that target online, the pose regressor estimates only the selected vehicle's relative pose, and MPC uses that estimate to keep the ego vehicle aligned with the target.
+The runtime stack is built around target identity. A user or simulator prompt identifies the target vehicle in frame 0, SAM3 tracks that target online, the pose regressor estimates only the selected vehicle's ego-frame pose, and MPC uses that estimate to keep the ego vehicle aligned with the target.
 
-**2. Per-target dataset collection and labeling**
+**2. Ego-frame pose supervision**
 
-The data pipeline stores each accepted ego RGB frame once and creates one training sample per visible target actor. Each target sample has its own mask, bounding box, simulator-reference pose row, and detector-matched pose row.
+The training target is the selected target vehicle's relative pose with respect to the ego vehicle, expressed in the ego frame: `dx`, `dy`, and relative yaw (`dyaw`). The current pipeline derives this supervision from LiDAR and a 3D vehicle detector. A previous version estimated the target's `dx` and `dy` from the centroid of a stereo-depth target point cloud and estimated target `dyaw` with PCA, which motivated the cleaner detector-based supervision pipeline.
 
 **3. Learned target pose regressor**
 
-The training pipeline learns a ConvNeXt-based regressor over full-frame RGB+mask, target-centered RGB+mask crop, and mask geometry features. It predicts `dx_m`, `dy_m`, and pursuit-aligned `yaw_follow_deg`.
+The training pipeline learns a ConvNeXt-based regressor over full-frame RGB+mask, target-centered RGB+mask crop, and mask geometry features. It predicts ego-frame target pose for pursuit control: `dx_m`, `dy_m`, and pursuit-aligned relative yaw as `yaw_follow_deg`.
 
 **4. Closed-loop evaluation harness**
 
@@ -82,7 +82,7 @@ SAM3 online tracker
         v
 Target pose regressor
   Inputs: RGB frame, target mask, target crop, mask geometry
-  Outputs: dx_m, dy_m, yaw_follow_deg
+  Outputs: ego-frame dx_m, dy_m, yaw_follow_deg
         |
         v
 MPC pursuit controller
@@ -97,7 +97,7 @@ The key interface is the target mask. It tells the perception model which vehicl
 
 ## Dataset Collection Pipeline
 
-The dataset pipeline in `carla_data_collection/` creates the supervised training data for target-relative pose estimation.
+The dataset pipeline in `carla_data_collection/` creates the supervised training data for ego-frame target pose estimation.
 
 What it collects:
 
@@ -120,13 +120,13 @@ dataset/
 └── collection_summary.json
 ```
 
-Important design choices:
+Pose supervision:
 
-- The dataset is **per-target**, not just per-frame.
-- Multiple target vehicles can share the same RGB image while using different masks and pose rows.
-- `gt_poses.csv` stores simulator-reference relative pose labels.
-- `pred_poses.csv` stores detector-matched labels used by the default training setup.
-- `dz_m` is kept for analysis, but the learned model predicts road-plane pursuit targets: `dx_m`, `dy_m`, and `yaw_follow_deg`.
+- The selected target vehicle's relative pose is represented in the ego frame as `dx_m`, `dy_m`, and relative yaw (`dyaw`).
+- `gt_poses.csv` stores simulator-reference ego-frame pose labels.
+- `pred_poses.csv` stores the LiDAR plus 3D-detector-derived labels used by the default training setup.
+- The model predicts road-plane pursuit targets: `dx_m`, `dy_m`, and pursuit-aligned `yaw_follow_deg`.
+- A previous version used stereo-depth target point clouds: centroid for `dx`/`dy`, PCA for `dyaw`.
 
 Example collection command:
 
@@ -167,9 +167,9 @@ Model outputs:
 
 - `dx_m`
 - `dy_m`
-- `yaw_follow_deg`
+- `yaw_follow_deg`, the pursuit-aligned form of relative yaw
 
-The default model is a shared-backbone ConvNeXt-Base regressor. Training uses grouped train/validation/test splits, translation normalization, weighted Smooth L1 translation loss, cosine yaw-vector loss, optional AMP, and optional Weights & Biases logging.
+The default model is a shared-backbone ConvNeXt-Base regressor trained from ego-frame pose supervision. Training uses grouped train/validation/test splits, translation normalization, weighted Smooth L1 translation loss, cosine yaw-vector loss, optional AMP, and optional Weights & Biases logging.
 
 Example training command:
 
@@ -199,7 +199,7 @@ The inference stack in `inference/` runs the complete online pursuit loop:
 1. Spawn a CARLA pursuit scenario.
 2. Bootstrap the selected target from a first-frame bounding box.
 3. Track the target with SAM3.
-4. Estimate target-relative pose with the trained CNN.
+4. Estimate ego-frame target pose with the trained CNN.
 5. Control the ego vehicle with MPC.
 6. Save closed-loop metrics and optional debug videos.
 
@@ -284,9 +284,9 @@ TargetSpecificAVP/
 
 ## Previous Prototype
 
-The demo video comes from an earlier stereo-depth variant. That prototype used stereo images, a foundation stereo model, SAM3 masks, target point-cloud filtering, centroid translation estimates, and PCA-based yaw estimates to create pose labels.
+The demo video comes from an earlier stereo-depth variant. That previous version used stereo images, a foundation stereo model, SAM3 masks, and target point-cloud filtering. It estimated `dx` and `dy` from the target point-cloud centroid and estimated `dyaw` from PCA.
 
-That approach helped validate the target-specific pursuit idea, but the PCA-based yaw labels were noisy and produced weaker closed-loop behavior. The current repo moves the main training pipeline to CARLA LiDAR plus 3D-detector-matched labels, which gives a cleaner supervision path for the ConvNeXt pose regressor.
+That approach helped validate the target-specific pursuit idea, but the centroid/PCA pose labels were noisy and produced weaker closed-loop behavior. The current repo moves the main training pipeline to CARLA LiDAR plus 3D-detector-matched labels, which gives a cleaner supervision path for the ConvNeXt pose regressor.
 
 ---
 
